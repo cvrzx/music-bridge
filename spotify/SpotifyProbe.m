@@ -3,7 +3,6 @@
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <stdatomic.h>
-#import <mach/mach_vm.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -33,8 +32,8 @@ static void inspectImage(const struct mach_header *raw,intptr_t slide){
  const struct nlist_64 *nl=(const void*)(base+sym->symoff);const char *strings=(const void*)(base+sym->stroff);const uint32_t *ind=(const void*)(base+dy->indirectsymoff);
  p=(const uint8_t*)(h+1);
  for(uint32_t i=0;i<h->ncmds;i++){const struct load_command *lc=(const void*)p;if(lc->cmd==LC_SEGMENT_64){const struct segment_command_64 *s=(const void*)p;const struct section_64 *sec=(const void*)(s+1);for(uint32_t j=0;j<s->nsects;j++){uint32_t type=sec[j].flags&SECTION_TYPE;if(type!=S_NON_LAZY_SYMBOL_POINTERS&&type!=S_LAZY_SYMBOL_POINTERS)continue;void **slots=(void**)(slide+sec[j].addr);for(uint64_t k=0;k<sec[j].size/sizeof(void*);k++){uint64_t ix=(uint64_t)sec[j].reserved1+k;if(ix>=dy->nindirectsyms)break;uint32_t si=ind[ix];if(si>=sym->nsyms)continue;uint32_t off=nl[si].n_un.n_strx;if(off>=sym->strsize)continue;const char *name=strings+off;if(*name!='_')continue;for(unsigned z=0;z<sizeof(targets)/sizeof(targets[0]);z++){if(strcmp(name+1,targets[z].name))continue;void *expected=dlsym(RTLD_DEFAULT,targets[z].name);if(!expected||slots[k]!=expected){atomic_fetch_add(&skipped,1);continue;}
- mach_vm_address_t addr=(mach_vm_address_t)&slots[k],region=addr;mach_vm_size_t size=0;vm_region_basic_info_data_64_t info;mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t obj=MACH_PORT_NULL;
- kern_return_t kr=mach_vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&obj);if(obj!=MACH_PORT_NULL)mach_port_deallocate(mach_task_self(),obj);
+ vm_address_t addr=(vm_address_t)&slots[k],region=addr;vm_size_t size=0;vm_region_basic_info_data_64_t info;mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t obj=MACH_PORT_NULL;
+ kern_return_t kr=vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&obj);if(obj!=MACH_PORT_NULL)mach_port_deallocate(mach_task_self(),obj);
  if(kr!=KERN_SUCCESS||addr<region||addr+sizeof(void*)>region+size||!(info.protection&VM_PROT_WRITE)){atomic_fetch_add(&skipped,1);continue;}
  __atomic_store_n(&slots[k],targets[z].replacement,__ATOMIC_RELEASE);atomic_fetch_add(&patched,1);
  }}}}p+=lc->cmdsize;}
