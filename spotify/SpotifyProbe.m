@@ -14,8 +14,25 @@
 // Mach VM API is not declared by the public iPhoneOS SDK headers. Same ABI used in MicFX.
 extern int mach_vm_protect(unsigned int,uint64_t,uint64_t,int,int);
 static _Atomic unsigned auInit,auStart,auProp,auRender,aqNew,aqEnqueue,fmtRate,fmtChannels,fmtBits,callbackSets,patched,skipped;
+static _Atomic unsigned importedMask,patchedMask,mismatchMask,deniedMask,restoreMask;
+static _Atomic unsigned unitCount,unitType[8],unitSubtype[8],unitMaker[8];
+static void recordUnit(AudioUnit u){
+ AudioComponent a=AudioComponentInstanceGetComponent(u);
+ AudioComponentDescription d={0};
+ if(!a||AudioComponentGetDescription(a,&d)!=noErr)return;
+ unsigned n=atomic_fetch_add(&unitCount,1);
+ if(n<8){atomic_store(&unitType[n],d.componentType);atomic_store(&unitSubtype[n],d.componentSubType);atomic_store(&unitMaker[n],d.componentManufacturer);}
+}
+static NSString *fourCC(unsigned v){char s[5]={0};for(int i=0;i<4;i++){unsigned char b=(unsigned char)(v>>(24-8*i));s[i]=(b>=32&&b<127)?(char)b:'.';}return [NSString stringWithUTF8String:s];}
+static NSString *unitReport(void){
+ NSMutableString *r=[NSMutableString string];
+ unsigned n=atomic_load(&unitCount);
+ [r appendFormat:@"\\nUnit descriptions: %u",n];
+ for(unsigned i=0;i<n&&i<8;i++)[r appendFormat:@"\\n  %u: %@/%@/%@",i+1,fourCC(atomic_load(&unitType[i])),fourCC(atomic_load(&unitSubtype[i])),fourCC(atomic_load(&unitMaker[i]))];
+ return r;
+}
 static void formatMeta(const AudioStreamBasicDescription *f){if(!f)return;atomic_store(&fmtRate,(unsigned)f->mSampleRate);atomic_store(&fmtChannels,f->mChannelsPerFrame);atomic_store(&fmtBits,f->mBitsPerChannel);}
-static OSStatus hInit(AudioUnit u){atomic_fetch_add(&auInit,1);return AudioUnitInitialize(u);}
+static OSStatus hInit(AudioUnit u){atomic_fetch_add(&auInit,1);OSStatus result=AudioUnitInitialize(u);recordUnit(u);return result;}
 static OSStatus hStart(AudioUnit u){atomic_fetch_add(&auStart,1);AudioStreamBasicDescription f={0};UInt32 n=sizeof(f);if(!AudioUnitGetProperty(u,kAudioUnitProperty_StreamFormat,kAudioUnitScope_Input,0,&f,&n))formatMeta(&f);return AudioOutputUnitStart(u);}
 static OSStatus hProp(AudioUnit u,AudioUnitPropertyID p,AudioUnitScope s,AudioUnitElement e,const void *d,UInt32 n){OSStatus result=AudioUnitSetProperty(u,p,s,e,d,n);atomic_fetch_add(&auProp,1);if(!result&&p==kAudioUnitProperty_StreamFormat&&d&&n==sizeof(AudioStreamBasicDescription))formatMeta(d);if(!result&&p==kAudioUnitProperty_SetRenderCallback)atomic_fetch_add(&callbackSets,1);return result;}
 static OSStatus hRender(AudioUnit u,AudioUnitRenderActionFlags *f,const AudioTimeStamp *t,UInt32 b,UInt32 n,AudioBufferList *l){atomic_fetch_add(&auRender,1);return AudioUnitRender(u,f,t,b,n,l);}
@@ -34,23 +51,24 @@ static void inspectImage(const struct mach_header *raw,intptr_t slide){
  uintptr_t base=(uintptr_t)(slide+link->vmaddr-link->fileoff);
  const struct nlist_64 *nl=(const void*)(base+sym->symoff);const char *strings=(const void*)(base+sym->stroff);const uint32_t *ind=(const void*)(base+dy->indirectsymoff);
  p=(const uint8_t*)(h+1);
- for(uint32_t i=0;i<h->ncmds;i++){const struct load_command *lc=(const void*)p;if(lc->cmd==LC_SEGMENT_64){const struct segment_command_64 *s=(const void*)p;const struct section_64 *sec=(const void*)(s+1);for(uint32_t j=0;j<s->nsects;j++){uint32_t type=sec[j].flags&SECTION_TYPE;if(type!=S_NON_LAZY_SYMBOL_POINTERS&&type!=S_LAZY_SYMBOL_POINTERS)continue;void **slots=(void**)(slide+sec[j].addr);for(uint64_t k=0;k<sec[j].size/sizeof(void*);k++){uint64_t ix=(uint64_t)sec[j].reserved1+k;if(ix>=dy->nindirectsyms)break;uint32_t si=ind[ix];if(si>=sym->nsyms)continue;uint32_t off=nl[si].n_un.n_strx;if(off>=sym->strsize)continue;const char *name=strings+off;if(*name!='_')continue;for(unsigned z=0;z<sizeof(targets)/sizeof(targets[0]);z++){if(strcmp(name+1,targets[z].name))continue;void *expected=dlsym(RTLD_DEFAULT,targets[z].name);if(!expected||slots[k]!=expected){atomic_fetch_add(&skipped,1);continue;}
+ for(uint32_t i=0;i<h->ncmds;i++){const struct load_command *lc=(const void*)p;if(lc->cmd==LC_SEGMENT_64){const struct segment_command_64 *s=(const void*)p;const struct section_64 *sec=(const void*)(s+1);for(uint32_t j=0;j<s->nsects;j++){uint32_t type=sec[j].flags&SECTION_TYPE;if(type!=S_NON_LAZY_SYMBOL_POINTERS&&type!=S_LAZY_SYMBOL_POINTERS)continue;void **slots=(void**)(slide+sec[j].addr);for(uint64_t k=0;k<sec[j].size/sizeof(void*);k++){uint64_t ix=(uint64_t)sec[j].reserved1+k;if(ix>=dy->nindirectsyms)break;uint32_t si=ind[ix];if(si>=sym->nsyms)continue;uint32_t off=nl[si].n_un.n_strx;if(off>=sym->strsize)continue;const char *name=strings+off;if(*name!='_')continue;for(unsigned z=0;z<sizeof(targets)/sizeof(targets[0]);z++){if(strcmp(name+1,targets[z].name))continue;atomic_fetch_or(&importedMask,1u<<z);void *expected=dlsym(RTLD_DEFAULT,targets[z].name);if(!expected||slots[k]!=expected){atomic_fetch_or(&mismatchMask,1u<<z);atomic_fetch_add(&skipped,1);continue;}
  // Temporarily make only the import-slot page writable, then restore its protection.
  // If iOS denies this, leave the slot untouched and report it as skipped.
  uint64_t pageSize=(uint64_t)getpagesize();
- if(!pageSize||(pageSize&(pageSize-1))){atomic_fetch_add(&skipped,1);continue;}
+ if(!pageSize||(pageSize&(pageSize-1))){atomic_fetch_or(&deniedMask,1u<<z);atomic_fetch_add(&skipped,1);continue;}
  uint64_t page=(uint64_t)((uintptr_t)&slots[k] & ~(uintptr_t)(pageSize-1));
  int originalProtection=s->initprot&(VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
  if(!strcmp(s->segname,"__DATA_CONST")||!strcmp(s->segname,"__AUTH_CONST"))originalProtection=VM_PROT_READ;
- if(!originalProtection||mach_vm_protect(mach_task_self(),page,pageSize,0,VM_PROT_READ|VM_PROT_WRITE)){atomic_fetch_add(&skipped,1);continue;}
+ if(!originalProtection||mach_vm_protect(mach_task_self(),page,pageSize,0,VM_PROT_READ|VM_PROT_WRITE)){atomic_fetch_or(&deniedMask,1u<<z);atomic_fetch_add(&skipped,1);continue;}
  __atomic_store_n(&slots[k],targets[z].replacement,__ATOMIC_RELEASE);
  if(mach_vm_protect(mach_task_self(),page,pageSize,0,originalProtection)){
    __atomic_store_n(&slots[k],expected,__ATOMIC_RELEASE);
    mach_vm_protect(mach_task_self(),page,pageSize,0,originalProtection);
+   atomic_fetch_or(&restoreMask,1u<<z);
    atomic_fetch_add(&skipped,1);
    continue;
  }
- atomic_fetch_add(&patched,1);
+ atomic_fetch_or(&patchedMask,1u<<z);atomic_fetch_add(&patched,1);
  }}}}p+=lc->cmdsize;}
 }
 
@@ -72,7 +90,7 @@ static void hook(Class cls,SEL sel,IMP replacement,IMP *original){if(!cls)return
 @property(nonatomic,strong) dispatch_source_t timer;
 @end
 @implementation Probe
-- (void)report:(UITapGestureRecognizer *)g {if(g.state!=UIGestureRecognizerStateRecognized)return;AVAudioSession *a=AVAudioSession.sharedInstance;NSString *r=[NSString stringWithFormat:@"Spotify Probe v2\nHooks: %u\nEngine starts: %u\nPlayer plays: %u\nPCM schedules: %u\nSample enqueues: %u\nPCM: %u Hz / %u ch\nSession: %.0f Hz / %ld ch\nCategory: %@\nMode: %@\nOptions: %lu\nInterruptions: %u\nHeartbeat: %u\nGroup: %@",hooks,atomic_load(&engines),atomic_load(&plays),atomic_load(&buffers),atomic_load(&samples),atomic_load(&rate),atomic_load(&channels),a.sampleRate,(long)a.outputNumberOfChannels,a.category,a.mode,(unsigned long)a.categoryOptions,atomic_load(&interrupts),atomic_load(&beats),groupStatus];r=[r stringByAppendingFormat:@"\nCore slots: %u / skipped %u\nAU init: %u\nAU start: %u\nAU properties: %u\nAU callbacks set: %u\nAU render: %u\nQueue create: %u\nQueue enqueue: %u\nCore format: %u Hz / %u ch / %u bits",atomic_load(&patched),atomic_load(&skipped),atomic_load(&auInit),atomic_load(&auStart),atomic_load(&auProp),atomic_load(&callbackSets),atomic_load(&auRender),atomic_load(&aqNew),atomic_load(&aqEnqueue),atomic_load(&fmtRate),atomic_load(&fmtChannels),atomic_load(&fmtBits)];UIViewController *v=((UIWindow *)g.view).rootViewController;while(v.presentedViewController)v=v.presentedViewController;if(!v)return;UIAlertController *alert=[UIAlertController alertControllerWithTitle:@"Audio Probe" message:r preferredStyle:UIAlertControllerStyleAlert];[alert addAction:[UIAlertAction actionWithTitle:@"Copy report" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *x){UIPasteboard.generalPasteboard.string=r;}]];[alert addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];[v presentViewController:alert animated:YES completion:nil];}
+- (void)report:(UITapGestureRecognizer *)g {if(g.state!=UIGestureRecognizerStateRecognized)return;AVAudioSession *a=AVAudioSession.sharedInstance;NSString *r=[NSString stringWithFormat:@"Spotify Probe v3\nHooks: %u\nEngine starts: %u\nPlayer plays: %u\nPCM schedules: %u\nSample enqueues: %u\nPCM: %u Hz / %u ch\nSession: %.0f Hz / %ld ch\nCategory: %@\nMode: %@\nOptions: %lu\nInterruptions: %u\nHeartbeat: %u\nGroup: %@",hooks,atomic_load(&engines),atomic_load(&plays),atomic_load(&buffers),atomic_load(&samples),atomic_load(&rate),atomic_load(&channels),a.sampleRate,(long)a.outputNumberOfChannels,a.category,a.mode,(unsigned long)a.categoryOptions,atomic_load(&interrupts),atomic_load(&beats),groupStatus];r=[r stringByAppendingFormat:@"\nCore slots: %u / skipped %u\nAU init: %u\nAU start: %u\nAU properties: %u\nAU callbacks set: %u\nAU render: %u\nQueue create: %u\nQueue enqueue: %u\nCore format: %u Hz / %u ch / %u bits",atomic_load(&patched),atomic_load(&skipped),atomic_load(&auInit),atomic_load(&auStart),atomic_load(&auProp),atomic_load(&callbackSets),atomic_load(&auRender),atomic_load(&aqNew),atomic_load(&aqEnqueue),atomic_load(&fmtRate),atomic_load(&fmtChannels),atomic_load(&fmtBits)];r=[r stringByAppendingFormat:@"\\nImport masks (Init/Start/Set/Render/QNew/QSend):\\nFound: %02X Hooked: %02X\\nMismatch: %02X Denied: %02X Restore: %02X",atomic_load(&importedMask),atomic_load(&patchedMask),atomic_load(&mismatchMask),atomic_load(&deniedMask),atomic_load(&restoreMask)];r=[r stringByAppendingString:unitReport()];UIViewController *v=((UIWindow *)g.view).rootViewController;while(v.presentedViewController)v=v.presentedViewController;if(!v)return;UIAlertController *alert=[UIAlertController alertControllerWithTitle:@"Audio Probe" message:r preferredStyle:UIAlertControllerStyleAlert];[alert addAction:[UIAlertAction actionWithTitle:@"Copy report" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *x){UIPasteboard.generalPasteboard.string=r;}]];[alert addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];[v presentViewController:alert animated:YES completion:nil];}
 - (void)attach {for(UIScene *s in UIApplication.sharedApplication.connectedScenes){if(![s isKindOfClass:UIWindowScene.class])continue;for(UIWindow *w in ((UIWindowScene *)s).windows){if(!w.isKeyWindow)continue;BOOL exists=NO;for(UIGestureRecognizer *g in w.gestureRecognizers)if([g.name isEqualToString:@"SpotifyProbe"])exists=YES;if(exists)continue;UITapGestureRecognizer *g=[[UITapGestureRecognizer alloc]initWithTarget:self action:@selector(report:)];g.name=@"SpotifyProbe";g.numberOfTouchesRequired=3;g.numberOfTapsRequired=2;g.cancelsTouchesInView=NO;[w addGestureRecognizer:g];}}}
 @end
 static Probe *probe;
