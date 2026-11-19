@@ -1,0 +1,14 @@
+{
+  "name": "MicFX Voice Studio v4",
+  "description": "Native microphone DSP and experimental shared-group music mixer. Requires v4 dylib.",
+  "authors": [
+    {
+      "name": "MicFX"
+    }
+  ],
+  "main": "index.js",
+  "hash": "d3efe2532b9837496f4c8ab2476bb3a2685a402722ee8f6ba64c5c8d28a5a3d9",
+  "vendetta": {
+    "icon": "MicrophoneIcon"
+  }
+}

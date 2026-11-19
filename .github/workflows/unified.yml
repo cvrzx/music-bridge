@@ -1,0 +1,23 @@
+name: Unified Music Bridge
+on:
+  push:
+    branches: [unified-development]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash native/build.sh
+      - run: bash spotify/build.sh
+      - run: |
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          mkdir -p dist
+          cp MicFX.dylib spotify/SpotifyProbe.dylib plugin/index.js plugin/manifest.json dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Music-Bridge-Unified
+          path: dist/*
+          if-no-files-found: error
