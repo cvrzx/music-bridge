@@ -10,6 +10,9 @@
 #import <mach/mach.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <unistd.h>
+// Mach VM API is not declared by the public iPhoneOS SDK headers. Same ABI used in MicFX.
+extern int mach_vm_protect(unsigned int,uint64_t,uint64_t,int,int);
 static _Atomic unsigned auInit,auStart,auProp,auRender,aqNew,aqEnqueue,fmtRate,fmtChannels,fmtBits,callbackSets,patched,skipped;
 static void formatMeta(const AudioStreamBasicDescription *f){if(!f)return;atomic_store(&fmtRate,(unsigned)f->mSampleRate);atomic_store(&fmtChannels,f->mChannelsPerFrame);atomic_store(&fmtBits,f->mBitsPerChannel);}
 static OSStatus hInit(AudioUnit u){atomic_fetch_add(&auInit,1);return AudioUnitInitialize(u);}
@@ -32,10 +35,22 @@ static void inspectImage(const struct mach_header *raw,intptr_t slide){
  const struct nlist_64 *nl=(const void*)(base+sym->symoff);const char *strings=(const void*)(base+sym->stroff);const uint32_t *ind=(const void*)(base+dy->indirectsymoff);
  p=(const uint8_t*)(h+1);
  for(uint32_t i=0;i<h->ncmds;i++){const struct load_command *lc=(const void*)p;if(lc->cmd==LC_SEGMENT_64){const struct segment_command_64 *s=(const void*)p;const struct section_64 *sec=(const void*)(s+1);for(uint32_t j=0;j<s->nsects;j++){uint32_t type=sec[j].flags&SECTION_TYPE;if(type!=S_NON_LAZY_SYMBOL_POINTERS&&type!=S_LAZY_SYMBOL_POINTERS)continue;void **slots=(void**)(slide+sec[j].addr);for(uint64_t k=0;k<sec[j].size/sizeof(void*);k++){uint64_t ix=(uint64_t)sec[j].reserved1+k;if(ix>=dy->nindirectsyms)break;uint32_t si=ind[ix];if(si>=sym->nsyms)continue;uint32_t off=nl[si].n_un.n_strx;if(off>=sym->strsize)continue;const char *name=strings+off;if(*name!='_')continue;for(unsigned z=0;z<sizeof(targets)/sizeof(targets[0]);z++){if(strcmp(name+1,targets[z].name))continue;void *expected=dlsym(RTLD_DEFAULT,targets[z].name);if(!expected||slots[k]!=expected){atomic_fetch_add(&skipped,1);continue;}
- vm_address_t addr=(vm_address_t)&slots[k],region=addr;vm_size_t size=0;vm_region_basic_info_data_64_t info;mach_msg_type_number_t count=VM_REGION_BASIC_INFO_COUNT_64;mach_port_t obj=MACH_PORT_NULL;
- kern_return_t kr=vm_region(mach_task_self(),&region,&size,VM_REGION_BASIC_INFO_64,(vm_region_info_t)&info,&count,&obj);if(obj!=MACH_PORT_NULL)mach_port_deallocate(mach_task_self(),obj);
- if(kr!=KERN_SUCCESS||addr<region||addr+sizeof(void*)>region+size||!(info.protection&VM_PROT_WRITE)){atomic_fetch_add(&skipped,1);continue;}
- __atomic_store_n(&slots[k],targets[z].replacement,__ATOMIC_RELEASE);atomic_fetch_add(&patched,1);
+ // Temporarily make only the import-slot page writable, then restore its protection.
+ // If iOS denies this, leave the slot untouched and report it as skipped.
+ uint64_t pageSize=(uint64_t)getpagesize();
+ if(!pageSize||(pageSize&(pageSize-1))){atomic_fetch_add(&skipped,1);continue;}
+ uint64_t page=(uint64_t)((uintptr_t)&slots[k] & ~(uintptr_t)(pageSize-1));
+ int originalProtection=s->initprot&(VM_PROT_READ|VM_PROT_WRITE|VM_PROT_EXECUTE);
+ if(!strcmp(s->segname,"__DATA_CONST")||!strcmp(s->segname,"__AUTH_CONST"))originalProtection=VM_PROT_READ;
+ if(!originalProtection||mach_vm_protect(mach_task_self(),page,pageSize,0,VM_PROT_READ|VM_PROT_WRITE)){atomic_fetch_add(&skipped,1);continue;}
+ __atomic_store_n(&slots[k],targets[z].replacement,__ATOMIC_RELEASE);
+ if(mach_vm_protect(mach_task_self(),page,pageSize,0,originalProtection)){
+   __atomic_store_n(&slots[k],expected,__ATOMIC_RELEASE);
+   mach_vm_protect(mach_task_self(),page,pageSize,0,originalProtection);
+   atomic_fetch_add(&skipped,1);
+   continue;
+ }
+ atomic_fetch_add(&patched,1);
  }}}}p+=lc->cmdsize;}
 }
 
