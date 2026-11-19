@@ -1,0 +1,16 @@
+name: Build Music Bridge Test
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build unsigned test IPAs
+        run: bash build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Music-Bridge-Test-IPAs
+          path: dist/*.ipa
+          if-no-files-found: error
