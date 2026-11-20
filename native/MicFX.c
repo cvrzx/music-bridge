@@ -46,10 +46,10 @@ static OSStatus initHook(AU u) {
     ComponentDesc d={0}; ASBD f={0}; U32 size=sizeof(f); void *c=getComp(u);
     if(!c||getDesc(c,&d)||d.type!=FOUR('a','u','o','u')||d.manufacturer!=FOUR('a','p','p','l')||(d.subtype!=FOUR('r','i','o','c')&&d.subtype!=FOUR('v','p','i','o')))return r;
     clearCapture(u);
-    /* The mic stream is generally OUTPUT scope on the RemoteIO input bus (1).
-       Fall back to the legacy input scope for Discord builds using that layout. */
-    int valid=!getProp(u,8,1,1,&f,&size)&&size==sizeof(f)&&f.format==FOUR('l','p','c','m')&&f.channels==1&&f.rate>=8000&&f.rate<=96000&&f.framesPacket==1&&!(f.flags&2u)&&(f.flags&8u);
-    if(!valid){memset(&f,0,sizeof(f));size=sizeof(f);valid=!getProp(u,8,2,1,&f,&size)&&size==sizeof(f)&&f.format==FOUR('l','p','c','m')&&f.channels==1&&f.rate>=8000&&f.rate<=96000&&f.framesPacket==1&&!(f.flags&2u)&&(f.flags&8u);}
+    /* Microphone audio is rendered from RemoteIO input bus 1. Its client PCM
+       format is usually Output scope; accept Input scope as a fallback. */
+    int valid=!getProp(u,8,2,1,&f,&size)&&size==sizeof(f)&&f.format==FOUR('l','p','c','m')&&f.channels==1&&f.rate>=8000&&f.rate<=96000&&f.framesPacket==1&&!(f.flags&2u)&&(f.flags&8u);
+    if(!valid){memset(&f,0,sizeof(f));size=sizeof(f);valid=!getProp(u,8,1,1,&f,&size)&&size==sizeof(f)&&f.format==FOUR('l','p','c','m')&&f.channels==1&&f.rate>=8000&&f.rate<=96000&&f.framesPacket==1&&!(f.flags&2u)&&(f.flags&8u);}
     if(!valid)return r;
     U32 kind=0;if(f.bits==16&&f.bytesFrame==2&&(f.flags&4u)&&!(f.flags&1u))kind=1;else if(f.bits==32&&f.bytesFrame==4&&(f.flags&1u))kind=2;
     if(!kind)return r;
