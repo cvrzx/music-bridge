@@ -1,13 +1,13 @@
 {
   "name": "MicFX Voice Studio v4",
-  "description": "Native microphone pitch, EQ, persistent Spotify bridge, named presets, and advanced gain controls. Requires matching MicFX dylib.",
+  "description": "Native microphone pitch and EQ, persistent Spotify bridge, independent music pitch and gain, custom presets, and advanced mic gain. Requires matching native dylib.",
   "authors": [
     {
       "name": "MicFX"
     }
   ],
   "main": "index.js",
-  "hash": "38246f5d6b2b4f0d307f6f0bce0e53b2eeb03c6f8dd8239f765351fa94e1923c",
+  "hash": "7f91736563b043850850b3545dfa398eca909a2c2dade3fcc5ddd056187e6516",
   "vendetta": {
     "icon": "MicrophoneIcon"
   }
