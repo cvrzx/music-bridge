@@ -1,0 +1,14 @@
+{
+  "name": "MicFX Voice Studio v4.3 repair test",
+  "description": "Isolated MicFX repair with preserved v4 controls, Spotify PCM receiver diagnostics, loud mic dynamics, and Discord 344.1 voice-bar controls. Requires matching signed native dylibs.",
+  "authors": [
+    {
+      "name": "MicFX"
+    }
+  ],
+  "main": "index.js",
+  "hash": "facb3173634c53ef5750ede9ab1a7dcaea6f5817991675a32e881c9dab6e46dc",
+  "vendetta": {
+    "icon": "MicrophoneIcon"
+  }
+}
