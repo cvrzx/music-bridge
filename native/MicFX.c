@@ -6,6 +6,7 @@
 #include "LoudVoice.h"
 #include "DrumShape.h"
 #include "ToneEQ.h"
+#include "PanelAssets.h"
 #include "MicMonitor.h"
 #include "MusicInput.h"
 #include <unistd.h>
@@ -298,7 +299,9 @@ static void monitorUpdate(void*d,int hooked){
     putNum(d,"MicFXMonitorUnderflows",atomic_load(&monUnderflows));
 }
 static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;
+    char panelDir[1024]={0};int hasPanels=panel_cache(panelDir,sizeof(panelDir));int reportedPanels=0;
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
+        if(!reportedPanels){put(d,"MicFXPanelsPath",hasPanels?panelDir:"");reportedPanels=1;}
         int requestedPitch=getNum(d,"MicFXPitchEnabled")==1.0;
         int requestedOnly=getNum(d,"MicFXMicDspEnabled")==1.0;
         int requestedLoud=getNum(d,"MicFXLoudMicEnabled")==1.0;
