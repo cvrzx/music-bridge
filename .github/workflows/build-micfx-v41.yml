@@ -1,9 +1,10 @@
-name: MicFX v4.1 native build
+name: MicFX v4.2 restored features build
 on:
   workflow_dispatch:
   push:
     paths:
       - "native/**"
+      - "plugin/**"
       - ".github/workflows/build-micfx-v41.yml"
 permissions:
   contents: read
@@ -12,6 +13,10 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - name: Check plugin JavaScript and print digest
+        run: |
+          node --check plugin/index.js
+          shasum -a 256 plugin/index.js
       - name: Build MicFX native dylib
         run: bash native/build.sh
       - name: Validate arm64 binary
@@ -20,6 +25,6 @@ jobs:
           xcrun lipo MicFX.dylib -verify_arch arm64
       - uses: actions/upload-artifact@v4
         with:
-          name: MicFX-v4.1-dylib
+          name: MicFX-v4.2-dylib
           path: MicFX.dylib
           if-no-files-found: error

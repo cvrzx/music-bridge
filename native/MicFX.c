@@ -5,6 +5,7 @@
 #include "pitch.h"
 #include "MusicInput.h"
 #include <unistd.h>
+#include <string.h>
 typedef void *AU; typedef int32_t OSStatus; typedef uint32_t U32;
 typedef struct { U32 channels, bytes; void *data; } Buffer;
 typedef struct { U32 count; Buffer buffers[1]; } Buffers;
@@ -26,11 +27,16 @@ static void *(*getComp)(AU); static OSStatus (*getDesc)(void*,ComponentDesc*);
 static _Atomic(uintptr_t) capture;
 static _Atomic(U32) sampleRate,formatKind,generation,processed,enabled;
 static _Atomic(float) ratio=1.f,gain=1.f,blend=1.f,eqGain[MF_EQ];
+static _Atomic(float) musicAdvancedGain=1.f;
+static _Atomic(U32) musicPitchEnabled,musicAdvancedGainEnabled;
 static _Atomic(U32) eqEnabled,configSeq;
 static const char *eqKeys[MF_EQ]={"MicFXEQ0","MicFXEQ1","MicFXEQ2","MicFXEQ3","MicFXEQ4","MicFXEQ5","MicFXEQ6","MicFXEQ7"};
 static float dspRatio=1.f,dspGain=1.f,dspMix=1.f,dspBands[MF_EQ];static U32 dspEq;
 static atomic_flag renderBusy=ATOMIC_FLAG_INIT;
-static MFPitch dsp; static U32 dspGeneration; static const char *bootStatus="Native bridge not initialized";
+static MFPitch dsp,musicDsp;
+static U32 dspGeneration,musicDspGeneration;
+static int musicDspFlags=-1;
+static const char *bootStatus="Native bridge not initialized";
 static void clearCapture(AU u) { uintptr_t expected=(uintptr_t)u; if(atomic_compare_exchange_strong(&capture,&expected,0)) atomic_fetch_add(&generation,1); }
 static OSStatus initHook(AU u) {
     OSStatus r=origInit(u); if(r)return r;
@@ -53,9 +59,31 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         // Coherent snapshot without blocking the real-time thread. If a writer is active, retain prior settings.
         U32 seq=atomic_load(&configSeq);if(!(seq&1u)){float p=atomic_load(&ratio),g=atomic_load(&gain),m=atomic_load(&blend),bands[MF_EQ];U32 e=atomic_load(&eqEnabled);for(unsigned i=0;i<MF_EQ;i++)bands[i]=atomic_load(&eqGain[i]);if(seq==atomic_load(&configSeq)){dspRatio=p;dspGain=g;dspMix=m;dspEq=e;for(unsigned i=0;i<MF_EQ;i++)dspBands[i]=bands[i];}}
         float p=dspRatio,g=dspGain,m=dspMix;mf_config(&dsp,p,dspEq,dspBands,sr);
-        int fx=atomic_load(&enabled), mus=atomic_load(&musicOn);int locked=mus&&pthread_mutex_trylock(&musicLock)==0;float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
+        int fx=atomic_load(&enabled), mus=atomic_load(&musicOn);
+        int pitchMusic=mus&&fx&&atomic_load(&musicPitchEnabled);
+        int boostMusic=mus&&atomic_load(&musicAdvancedGainEnabled);
+        int musicProcessingFlags=(pitchMusic?1:0)|(boostMusic?2:0);
+        if(musicDspGeneration!=gen||musicDspFlags!=musicProcessingFlags){
+            mf_reset(&musicDsp);
+            musicDspGeneration=gen;
+            musicDspFlags=musicProcessingFlags;
+        }
+        if(musicProcessingFlags){
+            const float flatMusicEq[MF_EQ]={0};
+            mf_config(&musicDsp,pitchMusic?p:1.f,0,flatMusicEq,sr);
+        }
+        float musicBoostFactor=boostMusic?atomic_load(&musicAdvancedGain):1.f;
+        int locked=mus&&pthread_mutex_trylock(&musicLock)==0;
+        float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
         int silent=flags&&(*flags&16u);int audible=0;
-        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;if(mus){float z=locked?musicNext(sr):0;y=mf_clip(y*iv+z*mv);if(z!=0)audible=1;}if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
+        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;if(mus){
+            float z=locked?musicNext(sr):0;
+            // Separate processor: music pitch/boost never changes the microphone pitch state.
+            // mf_sample applies a peak limiter after high custom gain to music.
+            if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
+            y=mf_clip(y*iv+z*mv);
+            if(z!=0)audible=1;
+        }if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
         if(locked)pthread_mutex_unlock(&musicLock);if(audible){if(flags)*flags&=~16u;atomic_fetch_add(&musicMixed,1);}
         atomic_fetch_add(&processed,1);
     }atomic_flag_clear(&renderBusy);return r;
@@ -93,56 +121,107 @@ static double getNum(void *defaults,const char *key){return ((double(*)(void*,vo
 static void put(void *defaults,const char *key,const char *val){((void(*)(void*,void*,void*,void*))msg)(defaults,sel("setObject:forKey:"),str(val),str(key));}
 static void putNum(void *defaults,const char *key,double val){((void(*)(void*,void*,double,void*))msg)(defaults,sel("setDouble:forKey:"),val,str(key));}
 
-// Opt-in: preserve Discord's chosen call category and mode, adding only the public
-// AVAudioSessionCategoryOptionMixWithOthers bit (1). This can help other playback
-// sessions coexist, but iOS may still interrupt Spotify or change routing.
-// No audio buffers are accessed or recorded by this hook.
-typedef signed char MBObjCBool;
-static _Atomic(U32) callMixRequested;
-static int callMixHooked;
-static MBObjCBool (*origSessionCategory)(void*,void*,void*,void*,unsigned long,void**);
-static MBObjCBool sessionCategoryHook(void *receiver,void *cmd,void *category,void *mode,unsigned long options,void **error){
-    if(atomic_load(&callMixRequested)&&category){
-        void *playRecord=str("AVAudioSessionCategoryPlayAndRecord");
-        if(((MBObjCBool(*)(void*,void*,void*))msg)(category,sel("isEqualToString:"),playRecord))options|=1ul;
-    }
-    return origSessionCategory(receiver,cmd,category,mode,options,error);
+/* Discord background-audio coexistence.
+ * Keep Discord's category, mode, routes and options intact and add only the
+ * public MixWithOthers bit while the existing Music Bridge switch is enabled.
+ * Hooks cover the common AVAudioSession setters; a rate-limited reapply covers
+ * a voice session that was activated before the plugin switch was enabled.
+ * No audio samples are accessed here. */
+static _Atomic(int) musicMixEnabled;
+static _Atomic(unsigned) musicMixHooks,musicMixPatches,musicMixAttempts,musicMixFailures;
+typedef signed char (*Mix3)(void *,void *,void *,unsigned long,void *);
+typedef signed char (*Mix4)(void *,void *,void *,void *,unsigned long,void *);
+typedef signed char (*Mix5)(void *,void *,void *,void *,long,unsigned long,void *);
+static Mix3 previousCategoryOptions;
+static Mix4 previousCategoryMode;
+static Mix5 previousCategoryRoute;
+static int matchMixCategory(void *cat){
+    if(!cat||!msg)return 0;
+    const char *v=((const char *(*)(void *,void *))msg)(cat,sel("UTF8String"));
+    return v&&(!strcmp(v,"AVAudioSessionCategoryPlayAndRecord")||
+               !strcmp(v,"AVAudioSessionCategoryPlayback")||
+               !strcmp(v,"AVAudioSessionCategoryMultiRoute"));
 }
-static int installCallMixHook(void){
+static unsigned long addMix(void *category,unsigned long options){
+    if(atomic_load(&musicMixEnabled)&&matchMixCategory(category)){
+        if(!(options&1ul))atomic_fetch_add(&musicMixPatches,1);
+        return options|1ul;
+    }
+    return options;
+}
+static signed char mixedCategoryOptions(void *self,void *cmd,void *category,unsigned long opts,void *err){
+    return previousCategoryOptions(self,cmd,category,addMix(category,opts),err);
+}
+static signed char mixedCategoryMode(void *self,void *cmd,void *category,void *mode,unsigned long opts,void *err){
+    return previousCategoryMode(self,cmd,category,mode,addMix(category,opts),err);
+}
+static signed char mixedCategoryRoute(void *self,void *cmd,void *category,void *mode,long policy,unsigned long opts,void *err){
+    return previousCategoryRoute(self,cmd,category,mode,policy,addMix(category,opts),err);
+}
+static int installMusicSessionHooks(void){
+    if(atomic_load(&musicMixHooks))return 1;
+    if(!getClass||!sel||!msg)return 0;
     void *cls=getClass("AVAudioSession");
     if(!cls)return 0;
-    void *(*classMethod)(void*,void*)=SYM("class_getInstanceMethod");
-    void *(*getIMP)(void*)=SYM("method_getImplementation");
-    void *(*setIMP)(void*,void*)=SYM("method_setImplementation");
-    if(!classMethod||!getIMP||!setIMP)return 0;
-    void *method=classMethod(cls,sel("setCategory:mode:options:error:"));
-    if(!method)return 0;
-    void *original=getIMP(method);
-    if(!original||original==(void*)sessionCategoryHook)return 0;
-    origSessionCategory=original;
-    setIMP(method,(void*)sessionCategoryHook);
-    return 1;
+    void *(*getMethod)(void *,void *)=SYM("class_getInstanceMethod");
+    void *(*replaceIMP)(void *,void *)=SYM("method_setImplementation");
+    if(!getMethod||!replaceIMP)return 0;
+    unsigned installed=0;
+    void *m=getMethod(cls,sel("setCategory:withOptions:error:"));
+    if(m){previousCategoryOptions=(Mix3)replaceIMP(m,(void *)mixedCategoryOptions);if(previousCategoryOptions)installed++;}
+    m=getMethod(cls,sel("setCategory:mode:options:error:"));
+    if(m){previousCategoryMode=(Mix4)replaceIMP(m,(void *)mixedCategoryMode);if(previousCategoryMode)installed++;}
+    m=getMethod(cls,sel("setCategory:mode:routeSharingPolicy:options:error:"));
+    if(m){previousCategoryRoute=(Mix5)replaceIMP(m,(void *)mixedCategoryRoute);if(previousCategoryRoute)installed++;}
+    atomic_store(&musicMixHooks,installed);
+    return installed!=0;
 }
+static void applyMusicSessionMix(void){
+    if(!atomic_load(&musicMixEnabled)||!atomic_load(&musicMixHooks))return;
+    void *sessionClass=getClass("AVAudioSession");
+    if(!sessionClass)return;
+    void *session=((void *(*)(void *,void *))msg)(sessionClass,sel("sharedInstance"));
+    if(!session)return;
+    void *category=((void *(*)(void *,void *))msg)(session,sel("category"));
+    if(!matchMixCategory(category))return;
+    unsigned long options=((unsigned long(*)(void *,void *))msg)(session,sel("categoryOptions"));
+    if(options&1ul)return;
+    if(!previousCategoryMode)return;
+    void *mode=((void *(*)(void *,void *))msg)(session,sel("mode"));
+    atomic_fetch_add(&musicMixAttempts,1);
+    signed char ok=((signed char (*)(void *,void *,void *,void *,unsigned long,void *))msg)(
+        session,sel("setCategory:mode:options:error:"),category,mode,options|1ul,0);
+    if(!ok)atomic_fetch_add(&musicMixFailures,1);
+}
+
 static float limit(double v,float lo,float hi){return !(v>=lo)?lo:v>hi?hi:(float)v;}
-static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;int lastMix=-1;
+static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
         int on=hooked&&getNum(d,"MicFXPitchEnabled")==1.0;float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
-        atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,g/20.f));atomic_store(&blend,m/100.f);
+        int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
+        int musicPitch=getNum(d,"MicFXMusicPitchEnabled")==1.0;
+        int musicBoost=getNum(d,"MicFXMusicAdvancedGainEnabled")==1.0;
+        float customGain=limit(getNum(d,"MicFXAdvancedGainDb"),0,240);
+        float effectiveGain=advanced?customGain:g;
+        atomic_store(&musicPitchEnabled,musicPitch);
+        atomic_store(&musicAdvancedGainEnabled,musicBoost);
+        atomic_store(&musicAdvancedGain,powf(10.f,customGain/20.f));
+        atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,effectiveGain/20.f));atomic_store(&blend,m/100.f);
         atomic_store(&eqEnabled,getNum(d,"MicFXEQEnabled")==1.0);for(unsigned i=0;i<MF_EQ;i++)atomic_store(&eqGain[i],limit(getNum(d,eqKeys[i]),-12,12));atomic_fetch_add(&configSeq,1);
-        int wantMix=hooked&&callMixHooked&&getNum(d,"MicFXMusicCallMix")==1.0;
-        atomic_store(&callMixRequested,wantMix);
-        if(wantMix!=lastMix){put(d,"MicFXCallMixStatus",!hooked?"Unavailable: MicFX audio hook not installed":!callMixHooked?"Unavailable: iOS session API not found":wantMix?"Mix With Others requested for future Discord PlayAndRecord category changes; unverified":"Off; future Discord category calls unchanged");lastMix=wantMix;}
         if(on!=activeLast){atomic_fetch_add(&generation,1);activeLast=on;}
-        atomic_store(&enabled,on);U32 now=atomic_load(&processed);const char *status=bootStatus;
+        atomic_store(&enabled,on);putNum(d,"MicFXAppliedGainDb",on?effectiveGain:0);
+        putNum(d,"MicFXMusicAppliedGainDb",musicBoost?customGain:0);
+        putNum(d,"MicFXMusicPitchOn",on&&musicPitch);
+        U32 now=atomic_load(&processed);const char *status=bootStatus;
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
         if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
-        if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;if(dir)musicRead(dir);else musicReset();put(d,"MicFXMusicStatus",dir?"Group accessible; check packet and mix counters":"App Group denied");}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));poolPop(pool);usleep(20000);
+        if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;if(dir)musicRead(dir);else musicReset();put(d,"MicFXMusicStatus",!dir?"App Group denied":allowMix?(atomic_load(&musicMixHooks)?"Group accessible; music-session mixing requested":"Group accessible; session mixing hooks unavailable"):"Group accessible; session mixing option off");}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));poolPop(pool);usleep(20000);
     }return 0;
 }
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
     // Ensure stale settings cannot enable processing on app launch, even after a previous crash.
-    void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");putNum(d,"MicFXMusicEnabled",0);putNum(d,"MicFXMusicCallMix",0);putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
-    int hooked=install();if(hooked)callMixHooked=installCallMixHook();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
+    void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
+    int hooked=install();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
 }
