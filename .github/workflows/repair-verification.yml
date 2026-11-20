@@ -3,6 +3,7 @@ on:
   push:
     branches:
       - fix/spotify-bridge-and-loudmic
+      - feature/micfx-processed-mic-preview
   workflow_dispatch:
 permissions:
   contents: read
@@ -19,6 +20,10 @@ jobs:
         run: |
           clang -std=c11 -O2 -Wall -Wextra tests/loudvoice_test.c -lm -o /tmp/micfx-loud-test
           /tmp/micfx-loud-test
+      - name: Test live monitor ring and default-off state
+        run: |
+          clang -std=c11 -O2 -Wall -Wextra tests/monitor_test.c -framework AudioToolbox -lm -o /tmp/micfx-monitor-test
+          /tmp/micfx-monitor-test
       - name: Test App Group receiver packet parser
         run: |
           clang -std=c11 -O2 -Wall -Wextra tests/bridge_reader_test.c -lm -lpthread -o /tmp/micfx-bridge-test
