@@ -1,4 +1,4 @@
-name: Unified Music Bridge
+name: Unified Music Bridge (Spotify bridge beta)
 on:
   push:
     branches: [unified-development]
@@ -15,7 +15,7 @@ jobs:
       - run: |
           xcrun lipo MicFX.dylib -verify_arch arm64
           mkdir -p dist
-          cp MicFX.dylib spotify/SpotifyProbe.dylib plugin/index.js plugin/manifest.json dist/
+          cp MicFX.dylib spotify/SpotifyBridge.dylib plugin/index.js plugin/manifest.json dist/
       - uses: actions/upload-artifact@v4
         with:
           name: Music-Bridge-Unified
