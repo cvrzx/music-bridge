@@ -1,0 +1,25 @@
+name: MicFX v4.1 native build
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "native/**"
+      - ".github/workflows/build-micfx-v41.yml"
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build MicFX native dylib
+        run: bash native/build.sh
+      - name: Validate arm64 binary
+        run: |
+          file MicFX.dylib
+          xcrun lipo -verify_arch arm64 MicFX.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-v4.1-dylib
+          path: MicFX.dylib
+          if-no-files-found: error
