@@ -184,6 +184,6 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
 }
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
     // Ensure stale settings cannot enable processing on app launch, even after a previous crash.
-    void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");putNum(d,"MicFXMusicEnabled",0);putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
+    void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
     int hooked=install();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
 }
