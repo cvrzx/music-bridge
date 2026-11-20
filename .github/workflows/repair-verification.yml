@@ -1,0 +1,43 @@
+name: Repair branch verification (MicFX + Spotify)
+on:
+  push:
+    branches:
+      - fix/spotify-bridge-and-loudmic
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate plugin syntax
+        run: node --check plugin/index.js
+      - name: Test loud mic processor
+        run: |
+          clang -std=c11 -O2 -Wall -Wextra tests/loudvoice_test.c -lm -o /tmp/micfx-loud-test
+          /tmp/micfx-loud-test
+      - name: Test App Group receiver packet parser
+        run: |
+          clang -std=c11 -O2 -Wall -Wextra tests/bridge_reader_test.c -lm -lpthread -o /tmp/micfx-bridge-test
+          /tmp/micfx-bridge-test
+      - name: Compile MicFX arm64 dylib
+        run: bash native/build.sh
+      - name: Compile Spotify arm64 dylib
+        run: bash spotify/build.sh
+      - name: Verify both binaries
+        run: |
+          file MicFX.dylib spotify/SpotifyBridge.dylib
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          xcrun lipo spotify/SpotifyBridge.dylib -verify_arch arm64
+      - name: Package isolated repair build
+        run: |
+          mkdir -p dist
+          cp MicFX.dylib spotify/SpotifyBridge.dylib plugin/index.js dist/
+          printf '%s\n' "Experimental repair build. Keep the installed version for rollback." > dist/README.txt
+          shasum -a 256 dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Spotify-MicFX-repair-test
+          path: dist/*
+          if-no-files-found: error
