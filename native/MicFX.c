@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdatomic.h>
 #include "pitch.h"
+#include "LoudVoice.h"
 #include "MusicInput.h"
 #include <unistd.h>
 #include <string.h>
@@ -29,11 +30,13 @@ static _Atomic(U32) sampleRate,formatKind,generation,processed,enabled;
 static _Atomic(float) ratio=1.f,gain=1.f,blend=1.f,eqGain[MF_EQ];
 static _Atomic(float) musicAdvancedGain=1.f;
 static _Atomic(U32) musicPitchEnabled,musicAdvancedGainEnabled;
-static _Atomic(U32) eqEnabled,configSeq;
+static _Atomic(U32) eqEnabled,configSeq,pitchActive,loudOn,micOnlyOn;
+static _Atomic(float) loudAmount,voiceColor;
 static const char *eqKeys[MF_EQ]={"MicFXEQ0","MicFXEQ1","MicFXEQ2","MicFXEQ3","MicFXEQ4","MicFXEQ5","MicFXEQ6","MicFXEQ7"};
 static float dspRatio=1.f,dspGain=1.f,dspMix=1.f,dspBands[MF_EQ];static U32 dspEq;
 static atomic_flag renderBusy=ATOMIC_FLAG_INIT;
 static MFPitch dsp,musicDsp;
+static MFLoudVoice loudVoice;
 static U32 dspGeneration,musicDspGeneration;
 static int musicDspFlags=-1;
 static const char *bootStatus="Native bridge not initialized";
@@ -43,7 +46,11 @@ static OSStatus initHook(AU u) {
     ComponentDesc d={0}; ASBD f={0}; U32 size=sizeof(f); void *c=getComp(u);
     if(!c||getDesc(c,&d)||d.type!=FOUR('a','u','o','u')||d.manufacturer!=FOUR('a','p','p','l')||(d.subtype!=FOUR('r','i','o','c')&&d.subtype!=FOUR('v','p','i','o')))return r;
     clearCapture(u);
-    if(getProp(u,8,2,1,&f,&size)||size!=sizeof(f)||f.format!=FOUR('l','p','c','m')||f.channels!=1||f.rate<8000||f.rate>96000||f.framesPacket!=1||(f.flags&2u)||!(f.flags&8u))return r;
+    /* The mic stream is generally OUTPUT scope on the RemoteIO input bus (1).
+       Fall back to the legacy input scope for Discord builds using that layout. */
+    int valid=!getProp(u,8,1,1,&f,&size)&&size==sizeof(f)&&f.format==FOUR('l','p','c','m')&&f.channels==1&&f.rate>=8000&&f.rate<=96000&&f.framesPacket==1&&!(f.flags&2u)&&(f.flags&8u);
+    if(!valid){memset(&f,0,sizeof(f));size=sizeof(f);valid=!getProp(u,8,2,1,&f,&size)&&size==sizeof(f)&&f.format==FOUR('l','p','c','m')&&f.channels==1&&f.rate>=8000&&f.rate<=96000&&f.framesPacket==1&&!(f.flags&2u)&&(f.flags&8u);}
+    if(!valid)return r;
     U32 kind=0;if(f.bits==16&&f.bytesFrame==2&&(f.flags&4u)&&!(f.flags&1u))kind=1;else if(f.bits==32&&f.bytesFrame==4&&(f.flags&1u))kind=2;
     if(!kind)return r;
     atomic_store(&capture,0); atomic_store(&sampleRate,(U32)f.rate);atomic_store(&formatKind,kind);atomic_fetch_add(&generation,1);atomic_store(&capture,(uintptr_t)u);return r;
@@ -55,12 +62,16 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
     U32 fmt=atomic_load(&formatKind),sr=atomic_load(&sampleRate),gen=atomic_load(&generation); if((fmt!=1&&fmt!=2)||sr<8000||sr>96000||b->buffers[0].bytes<n*(fmt==1?2u:4u))return r;
     if(atomic_flag_test_and_set(&renderBusy))return r;
     if(atomic_load(&capture)==(uintptr_t)u&&atomic_load(&generation)==gen){
-        if(dspGeneration!=gen){mf_reset(&dsp);dspGeneration=gen;}
+        if(dspGeneration!=gen){mf_reset(&dsp);mf_loud_reset(&loudVoice);dspGeneration=gen;}
         // Coherent snapshot without blocking the real-time thread. If a writer is active, retain prior settings.
         U32 seq=atomic_load(&configSeq);if(!(seq&1u)){float p=atomic_load(&ratio),g=atomic_load(&gain),m=atomic_load(&blend),bands[MF_EQ];U32 e=atomic_load(&eqEnabled);for(unsigned i=0;i<MF_EQ;i++)bands[i]=atomic_load(&eqGain[i]);if(seq==atomic_load(&configSeq)){dspRatio=p;dspGain=g;dspMix=m;dspEq=e;for(unsigned i=0;i<MF_EQ;i++)dspBands[i]=bands[i];}}
-        float p=dspRatio,g=dspGain,m=dspMix;mf_config(&dsp,p,dspEq,dspBands,sr);
+        int pitchEnabledNow=atomic_load(&pitchActive);
+        float p=pitchEnabledNow?dspRatio:1.f,g=dspGain,m=pitchEnabledNow?dspMix:0.f;
+        mf_config(&dsp,p,dspEq,dspBands,sr);
+        float loud=atomic_load(&loudAmount),color=atomic_load(&voiceColor);
+        float loudBoost=loud>0.f?powf(10.f,loud*.45f/20.f):1.f;
         int fx=atomic_load(&enabled), mus=atomic_load(&musicOn);
-        int pitchMusic=mus&&fx&&atomic_load(&musicPitchEnabled);
+        int pitchMusic=mus&&pitchEnabledNow&&atomic_load(&musicPitchEnabled);
         int boostMusic=mus&&atomic_load(&musicAdvancedGainEnabled);
         int musicProcessingFlags=(pitchMusic?1:0)|(boostMusic?2:0);
         if(musicDspGeneration!=gen||musicDspFlags!=musicProcessingFlags){
@@ -76,7 +87,9 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         int locked=mus&&pthread_mutex_trylock(&musicLock)==0;
         float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
         int silent=flags&&(*flags&16u);int audible=0;
-        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;if(mus){
+        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
+            if(fx&&(loud>0.f||color>0.f))y=mf_loud_sample(&loudVoice,y,loudBoost,loud,color,sr);
+            if(mus){
             float z=locked?musicNext(sr):0;
             // Separate processor: music pitch/boost never changes the microphone pitch state.
             // mf_sample applies a peak limiter after high custom gain to music.
@@ -197,13 +210,21 @@ static void applyMusicSessionMix(void){
 static float limit(double v,float lo,float hi){return !(v>=lo)?lo:v>hi?hi:(float)v;}
 static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
-        int on=hooked&&getNum(d,"MicFXPitchEnabled")==1.0;float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
+        int requestedPitch=getNum(d,"MicFXPitchEnabled")==1.0;
+        int requestedOnly=getNum(d,"MicFXMicDspEnabled")==1.0;
+        int requestedLoud=getNum(d,"MicFXLoudMicEnabled")==1.0;
+        int on=hooked&&(requestedPitch||requestedOnly||requestedLoud);float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
         int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
         int musicPitch=getNum(d,"MicFXMusicPitchEnabled")==1.0;
         int musicBoost=getNum(d,"MicFXMusicAdvancedGainEnabled")==1.0;
         float customGain=limit(getNum(d,"MicFXAdvancedGainDb"),0,240);
         float effectiveGain=advanced?customGain:g;
         atomic_store(&musicPitchEnabled,musicPitch);
+        atomic_store(&pitchActive,requestedPitch);
+        atomic_store(&micOnlyOn,requestedOnly);
+        atomic_store(&loudOn,requestedLoud);
+        atomic_store(&loudAmount,requestedLoud?limit(getNum(d,"MicFXLoudMicAmount"),0,100)/100.f:0.f);
+        atomic_store(&voiceColor,requestedLoud?limit(getNum(d,"MicFXVoiceColor"),0,100)/100.f:0.f);
         atomic_store(&musicAdvancedGainEnabled,musicBoost);
         atomic_store(&musicAdvancedGain,powf(10.f,customGain/20.f));
         atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,effectiveGain/20.f));atomic_store(&blend,m/100.f);
@@ -217,7 +238,16 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
         if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
-        if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;if(dir)musicRead(dir);else musicReset();put(d,"MicFXMusicStatus",!dir?"App Group denied":allowMix?(atomic_load(&musicMixHooks)?"Group accessible; music-session mixing requested":"Group accessible; session mixing hooks unavailable"):"Group accessible; session mixing option off");}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));poolPop(pool);usleep(20000);
+        if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;if(dir)musicRead(dir);else musicReset();unsigned readerState=atomic_load(&musicReadState);
+        const char *readerStatus=!dir?"App Group denied":
+          readerState==1?"App Group open; no Spotify packets visible (check matching signing/group)":
+          readerState==2?"App Group open; packet file invalid (check sender protocol)":
+          readerState==3?"App Group open; Spotify packets stale (sender paused or suspended)":
+          atomic_load(&musicPackets)?"Spotify PCM packets received; check Mixed buffers during live microphone":"App Group open; waiting for new Spotify PCM packets";
+        put(d,"MicFXMusicStatus",readerStatus);}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));
+        putNum(d,"MicFXMusicReadState",atomic_load(&musicReadState));putNum(d,"MicFXMusicFiles",atomic_load(&musicFileCount));
+        putNum(d,"MicFXMusicInvalid",atomic_load(&musicInvalidCount));putNum(d,"MicFXMusicStale",atomic_load(&musicStaleCount));
+        putNum(d,"MicFXMusicPacketAgeMs",atomic_load(&musicNewestAge));poolPop(pool);usleep(20000);
     }return 0;
 }
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
