@@ -13,6 +13,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Validate plugin syntax
         run: node --check plugin/index.js
+      - name: Validate test manifest
+        run: node -e "const f=require('./plugin/manifest.json');if(!f.main||!f.name)process.exit(1);"
       - name: Test loud mic processor
         run: |
           clang -std=c11 -O2 -Wall -Wextra tests/loudvoice_test.c -lm -o /tmp/micfx-loud-test
@@ -33,7 +35,7 @@ jobs:
       - name: Package isolated repair build
         run: |
           mkdir -p dist
-          cp MicFX.dylib spotify/SpotifyBridge.dylib plugin/index.js dist/
+          cp MicFX.dylib spotify/SpotifyBridge.dylib plugin/index.js plugin/manifest.json dist/
           printf '%s\n' "Experimental repair build. Keep the installed version for rollback." > dist/README.txt
           shasum -a 256 dist/*
       - uses: actions/upload-artifact@v4
