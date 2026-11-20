@@ -171,10 +171,13 @@ static float limit(double v,float lo,float hi){return !(v>=lo)?lo:v>hi?hi:(float
 static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
         int on=hooked&&getNum(d,"MicFXPitchEnabled")==1.0;float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
-        atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,g/20.f));atomic_store(&blend,m/100.f);
+        int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
+        float customGain=limit(getNum(d,"MicFXAdvancedGainDb"),0,240);
+        float effectiveGain=advanced?customGain:g;
+        atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,effectiveGain/20.f));atomic_store(&blend,m/100.f);
         atomic_store(&eqEnabled,getNum(d,"MicFXEQEnabled")==1.0);for(unsigned i=0;i<MF_EQ;i++)atomic_store(&eqGain[i],limit(getNum(d,eqKeys[i]),-12,12));atomic_fetch_add(&configSeq,1);
         if(on!=activeLast){atomic_fetch_add(&generation,1);activeLast=on;}
-        atomic_store(&enabled,on);U32 now=atomic_load(&processed);const char *status=bootStatus;
+        atomic_store(&enabled,on);putNum(d,"MicFXAppliedGainDb",on?effectiveGain:0);U32 now=atomic_load(&processed);const char *status=bootStatus;
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
