@@ -17,7 +17,7 @@ jobs:
       - name: Validate arm64 binary
         run: |
           file MicFX.dylib
-          xcrun lipo -verify_arch arm64 MicFX.dylib
+          xcrun lipo MicFX.dylib -verify_arch arm64
       - uses: actions/upload-artifact@v4
         with:
           name: MicFX-v4.1-dylib
