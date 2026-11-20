@@ -10,6 +10,8 @@ jobs:
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
+      - name: Check MicFX plugin JavaScript
+        run: node --check plugin/index.js
       - run: bash native/build.sh
       - run: bash spotify/build.sh
       - run: |
