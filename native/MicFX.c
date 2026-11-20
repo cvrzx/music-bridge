@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include "pitch.h"
 #include "LoudVoice.h"
+#include "MicMonitor.h"
 #include "MusicInput.h"
 #include <unistd.h>
 #include <string.h>
@@ -58,7 +59,7 @@ static OSStatus initHook(AU u) {
 static OSStatus uninitHook(AU u){clearCapture(u);return origUninit(u);}
 static OSStatus disposeHook(AU u){clearCapture(u);return origDispose(u);}
 static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers *b){
-    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn))||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
+    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!atomic_load(&monFeedOn))||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
     U32 fmt=atomic_load(&formatKind),sr=atomic_load(&sampleRate),gen=atomic_load(&generation); if((fmt!=1&&fmt!=2)||sr<8000||sr>96000||b->buffers[0].bytes<n*(fmt==1?2u:4u))return r;
     if(atomic_flag_test_and_set(&renderBusy))return r;
     if(atomic_load(&capture)==(uintptr_t)u&&atomic_load(&generation)==gen){
@@ -87,8 +88,19 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         int locked=mus&&pthread_mutex_trylock(&musicLock)==0;
         float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
         int silent=flags&&(*flags&16u);int audible=0;
-        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
+        int monitoring=atomic_load_explicit(&monFeedOn,memory_order_relaxed);
+        uint64_t monitorWrite=monitoring?atomic_load_explicit(&monWrite,memory_order_relaxed):0;
+        float monitorPower=0.f,monitorPeak=0.f;
+        if(!silent||mus||monitoring)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
             if(fx&&(loud>0.f||color>0.f))y=mf_loud_sample(&loudVoice,y,loudBoost,loud,color,sr);
+            /* Local preview taps the processed microphone only, before Spotify.
+               Does not duplicate/re-route anything into the voice encoder. */
+            if(monitoring){
+                float voice=mon_clip(y*(mus?iv:1.f));
+                mon_store_sample(monitorWrite+i,voice);
+                monitorPower+=voice*voice;
+                float peak=fabsf(voice);if(peak>monitorPeak)monitorPeak=peak;
+            }
             if(mus){
             float z=locked?musicNext(sr):0;
             // Separate processor: music pitch/boost never changes the microphone pitch state.
@@ -97,6 +109,11 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
             y=mf_clip(y*iv+z*mv);
             if(z!=0)audible=1;
         }if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
+        if(monitoring){
+            mon_publish_samples(monitorWrite,n);
+            atomic_store(&monRms,sqrtf(monitorPower/n));
+            atomic_store(&monPeak,monitorPeak);
+        }
         if(locked)pthread_mutex_unlock(&musicLock);if(audible){if(flags)*flags&=~16u;atomic_fetch_add(&musicMixed,1);}
         atomic_fetch_add(&processed,1);
     }atomic_flag_clear(&renderBusy);return r;
@@ -208,6 +225,38 @@ static void applyMusicSessionMix(void){
 }
 
 static float limit(double v,float lo,float hi){return !(v>=lo)?lo:v>hi?hi:(float)v;}
+/* Monitor runs as a separate local playback queue.
+   The Discord voice AudioUnit and Spotify packet bridge are not modified. */
+static void monitorUpdate(void*d,int hooked){
+    int want=hooked&&getNum(d,"MicFXMonitorEnabled")==1.0;
+    float volume=limit(getNum(d,"MicFXMonitorVolume"),0,100)/100.f;
+    unsigned sr=atomic_load(&sampleRate);
+    int captured=atomic_load(&capture)!=0;
+    static int retry=0;
+    if(!want){
+        if(monQueue)mon_stop();
+        retry=0;
+        put(d,"MicFXMonitorStatus","Off (local monitoring disabled)");
+    }else if(!captured||sr<8000||sr>96000){
+        if(monQueue)mon_stop();
+        put(d,"MicFXMonitorStatus","Waiting for Discord microphone; join a VC");
+    }else{
+        if(monQueue&&monQueueRate!=sr)mon_stop();
+        if(!monQueue&&((retry++%100)==0)){
+            if(!mon_start(sr,volume)){
+                put(d,"MicFXMonitorStatus","Local AudioQueue failed; try headphones / rejoin VC");
+            }
+        }
+        if(monQueue){
+            mon_set_volume(volume);
+            put(d,"MicFXMonitorStatus","Monitoring processed microphone locally; headphones recommended");
+        }
+    }
+    putNum(d,"MicFXMonitorRunning",atomic_load(&monRunning));
+    putNum(d,"MicFXMonitorRms",atomic_load(&monRms));
+    putNum(d,"MicFXMonitorPeak",atomic_load(&monPeak));
+    putNum(d,"MicFXMonitorUnderflows",atomic_load(&monUnderflows));
+}
 static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
         int requestedPitch=getNum(d,"MicFXPitchEnabled")==1.0;
@@ -247,7 +296,7 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         put(d,"MicFXMusicStatus",readerStatus);}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));
         putNum(d,"MicFXMusicReadState",atomic_load(&musicReadState));putNum(d,"MicFXMusicFiles",atomic_load(&musicFileCount));
         putNum(d,"MicFXMusicInvalid",atomic_load(&musicInvalidCount));putNum(d,"MicFXMusicStale",atomic_load(&musicStaleCount));
-        putNum(d,"MicFXMusicPacketAgeMs",atomic_load(&musicNewestAge));poolPop(pool);usleep(20000);
+        putNum(d,"MicFXMusicPacketAgeMs",atomic_load(&musicNewestAge));monitorUpdate(d,hooked);poolPop(pool);usleep(20000);
     }return 0;
 }
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
