@@ -1,4 +1,4 @@
-// iOS arm64 native experiment. No audio is recorded, retained beyond the DSP ring, or transmitted separately.
+// Endcord mic effects with opt-in local recording of the processed microphone.
 #include <stdint.h>
 #include <stddef.h>
 #include <stdatomic.h>
@@ -8,6 +8,7 @@
 #include "ToneEQ.h"
 #include "PanelAssets.h"
 #include "MicMonitor.h"
+#include "RecordBuffer.h"
 #include "MusicInput.h"
 #include <unistd.h>
 #include <string.h>
@@ -31,6 +32,9 @@ static OSStatus (*getProp)(AU,U32,U32,U32,void*,U32*);
 static void *(*getComp)(AU); static OSStatus (*getDesc)(void*,ComponentDesc*);
 static _Atomic(uintptr_t) capture;
 static _Atomic(U32) sampleRate,formatKind,generation,processed,enabled;
+unsigned mf_rec_capture_rate(void){
+    return atomic_load(&capture)?atomic_load(&sampleRate):0;
+}
 static _Atomic(float) ratio=1.f,gain=1.f,blend=1.f,eqGain[MF_EQ];
 static _Atomic(float) musicAdvancedGain=1.f;
 static _Atomic(U32) musicPitchEnabled,musicAdvancedGainEnabled;
@@ -69,7 +73,7 @@ static OSStatus initHook(AU u) {
 static OSStatus uninitHook(AU u){clearCapture(u);return origUninit(u);}
 static OSStatus disposeHook(AU u){clearCapture(u);return origDispose(u);}
 static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers *b){
-    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!atomic_load(&monFeedOn))||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
+    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!atomic_load(&monFeedOn)&&!atomic_load(&mfRec.armed))||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
     U32 fmt=atomic_load(&formatKind),sr=atomic_load(&sampleRate),gen=atomic_load(&generation); if((fmt!=1&&fmt!=2)||sr<8000||sr>96000||b->buffers[0].bytes<n*(fmt==1?2u:4u))return r;
     if(atomic_flag_test_and_set(&renderBusy))return r;
     if(atomic_load(&capture)==(uintptr_t)u&&atomic_load(&generation)==gen){
@@ -118,11 +122,13 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         int silent=flags&&(*flags&16u);int audible=0;
         int monitoring=atomic_load_explicit(&monFeedOn,memory_order_relaxed);
         uint64_t monitorWrite=monitoring?atomic_load_explicit(&monWrite,memory_order_relaxed):0;
+        MFRecordBlock *record=mf_rec_begin(n,sr);
         float monitorPower=0.f,monitorPeak=0.f;
-        if(!silent||mus||monitoring)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
+        if(!silent||mus||monitoring||record)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
             if(fx&&(loud>0.f||color>0.f))y=mf_loud_sample(&loudVoice,y,loudBoost,loud,color,sr);
             if(drum)y=drum_sample(&drumShape,y);
             if(tone)y=tone_sample(&toneEQ,y);
+            if(record)record->samples[i]=mon_clip(y);
             /* Local preview taps the processed microphone only, before Spotify.
                Does not duplicate/re-route anything into the voice encoder. */
             if(monitoring){
@@ -138,7 +144,13 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
             if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
             y=mf_clip(y*iv+z*mv);
             if(z!=0)audible=1;
-        }if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
+        }
+            if(fx||mus||monitoring){
+                if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);
+                else ((float*)b->buffers[0].data)[i]=y;
+            }
+        }
+        if(record)mf_rec_publish();
         if(monitoring){
             mon_publish_samples(monitorWrite,n);
             atomic_store(&monRms,sqrtf(monitorPower/n));
@@ -258,7 +270,8 @@ static float limit(double v,float lo,float hi){return !(v>=lo)?lo:v>hi?hi:(float
 /* Monitor runs as a separate local playback queue.
    The Discord voice AudioUnit and Spotify packet bridge are not modified. */
 static void monitorUpdate(void*d,int hooked){
-    int want=hooked&&getNum(d,"MicFXMonitorEnabled")==1.0;
+    int quiet=mf_rec_wants_quiet();
+    int want=!quiet&&hooked&&getNum(d,"MicFXMonitorEnabled")==1.0;
     float volume=limit(getNum(d,"MicFXMonitorVolume"),0,100)/100.f;
     unsigned sr=atomic_load(&sampleRate);
     int captured=atomic_load(&capture)!=0;
@@ -270,7 +283,7 @@ static void monitorUpdate(void*d,int hooked){
         if(monQueue)mon_stop();
         retry=0;
         previousVolume=-1.f;
-        status="Off (local monitoring disabled)";
+        status=quiet?"Live monitoring paused for the mic recorder":"Off (local monitoring disabled)";
     }else if(!captured||sr<8000||sr>96000){
         if(monQueue)mon_stop();
         previousVolume=-1.f;
@@ -289,6 +302,7 @@ static void monitorUpdate(void*d,int hooked){
             status="Monitoring processed microphone locally; headphones recommended";
         }else if(!status)status="Local AudioQueue unavailable; retrying";
     }
+    mf_rec_monitor_ack(quiet&&!monQueue);
     if(!previousStatus||strcmp(previousStatus,status)){
         put(d,"MicFXMonitorStatus",status);
         previousStatus=status;
@@ -347,7 +361,7 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
-        if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXBasiqAck",request);putNum(d,"MicFXDrumsAck",request);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
+        if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXBasiqAck",request);putNum(d,"MicFXRecordBuildAck",request);putNum(d,"MicFXDrumsAck",request);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
         if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;put(d,"MicFXMusicContainerPath",dir?dir:"DENIED");if(dir)musicRead(dir);else musicReset();unsigned readerState=atomic_load(&musicReadState);
         const char *readerStatus=!dir?"App Group denied":
           readerState==1?"App Group open; no Spotify packets visible (check matching signing/group)":
@@ -363,6 +377,6 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
     // Ensure stale settings cannot enable processing on app launch, even after a previous crash.
     void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXBasiqEnabled",0);putNum(d,"MicFXBasiqAck",0);putNum(d,"MicFXDrumsEnabled",0);putNum(d,"MicFXDrumsAck",0);putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
-    int hooked=install();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
+    int hooked=install();mf_rec_service_start(hooked);pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
 }
 
