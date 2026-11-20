@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include "pitch.h"
 #include "LoudVoice.h"
+#include "DrumShape.h"
 #include "MicMonitor.h"
 #include "MusicInput.h"
 #include <unistd.h>
@@ -38,6 +39,10 @@ static float dspRatio=1.f,dspGain=1.f,dspMix=1.f,dspBands[MF_EQ];static U32 dspE
 static atomic_flag renderBusy=ATOMIC_FLAG_INIT;
 static MFPitch dsp,musicDsp;
 static MFLoudVoice loudVoice;
+static MFDrumShape drumShape;
+// Pack all knob values in one atomic snapshot across the UI/audio boundary.
+static _Atomic(U32) drumControl;
+static U32 lastDrum,drumGeneration;
 static U32 dspGeneration,musicDspGeneration;
 static int musicDspFlags=-1;
 static const char *bootStatus="Native bridge not initialized";
@@ -66,6 +71,15 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         if(dspGeneration!=gen){mf_reset(&dsp);mf_loud_reset(&loudVoice);dspGeneration=gen;}
         // Coherent snapshot without blocking the real-time thread. If a writer is active, retain prior settings.
         U32 seq=atomic_load(&configSeq);if(!(seq&1u)){float p=atomic_load(&ratio),g=atomic_load(&gain),m=atomic_load(&blend),bands[MF_EQ];U32 e=atomic_load(&eqEnabled);for(unsigned i=0;i<MF_EQ;i++)bands[i]=atomic_load(&eqGain[i]);if(seq==atomic_load(&configSeq)){dspRatio=p;dspGain=g;dspMix=m;dspEq=e;for(unsigned i=0;i<MF_EQ;i++)dspBands[i]=bands[i];}}
+        U32 drum=atomic_load(&drumControl);
+        if(drum&&(lastDrum!=drum||drumGeneration!=gen)){
+            if(!lastDrum||drumGeneration!=gen)drumShape.rate=0;
+            float input=(float)((drum>>1)&127u)*.5f-30.f;
+            float output=(float)((drum>>8)&127u)*.5f-30.f;
+            drum_config(&drumShape,sr,input,output,(float)((drum>>15)&127u));
+            drumGeneration=gen;
+        }
+        lastDrum=drum;
         int pitchEnabledNow=atomic_load(&pitchActive);
         float p=pitchEnabledNow?dspRatio:1.f,g=dspGain,m=pitchEnabledNow?dspMix:0.f;
         mf_config(&dsp,p,dspEq,dspBands,sr);
@@ -93,6 +107,7 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         float monitorPower=0.f,monitorPeak=0.f;
         if(!silent||mus||monitoring)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
             if(fx&&(loud>0.f||color>0.f))y=mf_loud_sample(&loudVoice,y,loudBoost,loud,color,sr);
+            if(drum)y=drum_sample(&drumShape,y);
             /* Local preview taps the processed microphone only, before Spotify.
                Does not duplicate/re-route anything into the voice encoder. */
             if(monitoring){
@@ -273,7 +288,15 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         int requestedPitch=getNum(d,"MicFXPitchEnabled")==1.0;
         int requestedOnly=getNum(d,"MicFXMicDspEnabled")==1.0;
         int requestedLoud=getNum(d,"MicFXLoudMicEnabled")==1.0;
-        int on=hooked&&(requestedPitch||requestedOnly||requestedLoud);float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
+        U32 drum=0;
+        if(hooked&&getNum(d,"MicFXDrumsEnabled")==1){
+            U32 input=(U32)((limit(getNum(d,"MicFXDrumsInput"),-30,30)+30)*2+.5f);
+            U32 output=(U32)((limit(getNum(d,"MicFXDrumsOutput"),-30,30)+30)*2+.5f);
+            U32 process=(U32)(limit(getNum(d,"MicFXDrumsProcess"),0,100)+.5f);
+            drum=1u|(input<<1)|(output<<8)|(process<<15);
+        }
+        atomic_store(&drumControl,drum);
+        int on=hooked&&(requestedPitch||requestedOnly||requestedLoud||drum);float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
         int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
         int musicPitch=getNum(d,"MicFXMusicPitchEnabled")==1.0;
         int musicBoost=getNum(d,"MicFXMusicAdvancedGainEnabled")==1.0;
@@ -297,7 +320,7 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
-        if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
+        if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXDrumsAck",request);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
         if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;put(d,"MicFXMusicContainerPath",dir?dir:"DENIED");if(dir)musicRead(dir);else musicReset();unsigned readerState=atomic_load(&musicReadState);
         const char *readerStatus=!dir?"App Group denied":
           readerState==1?"App Group open; no Spotify packets visible (check matching signing/group)":
@@ -312,6 +335,7 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
 }
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
     // Ensure stale settings cannot enable processing on app launch, even after a previous crash.
-    void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
+    void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXDrumsEnabled",0);putNum(d,"MicFXDrumsAck",0);putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
     int hooked=install();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
 }
+
