@@ -27,11 +27,16 @@ static void *(*getComp)(AU); static OSStatus (*getDesc)(void*,ComponentDesc*);
 static _Atomic(uintptr_t) capture;
 static _Atomic(U32) sampleRate,formatKind,generation,processed,enabled;
 static _Atomic(float) ratio=1.f,gain=1.f,blend=1.f,eqGain[MF_EQ];
+static _Atomic(float) musicAdvancedGain=1.f;
+static _Atomic(U32) musicPitchEnabled,musicAdvancedGainEnabled;
 static _Atomic(U32) eqEnabled,configSeq;
 static const char *eqKeys[MF_EQ]={"MicFXEQ0","MicFXEQ1","MicFXEQ2","MicFXEQ3","MicFXEQ4","MicFXEQ5","MicFXEQ6","MicFXEQ7"};
 static float dspRatio=1.f,dspGain=1.f,dspMix=1.f,dspBands[MF_EQ];static U32 dspEq;
 static atomic_flag renderBusy=ATOMIC_FLAG_INIT;
-static MFPitch dsp; static U32 dspGeneration; static const char *bootStatus="Native bridge not initialized";
+static MFPitch dsp,musicDsp;
+static U32 dspGeneration,musicDspGeneration;
+static int musicDspFlags=-1;
+static const char *bootStatus="Native bridge not initialized";
 static void clearCapture(AU u) { uintptr_t expected=(uintptr_t)u; if(atomic_compare_exchange_strong(&capture,&expected,0)) atomic_fetch_add(&generation,1); }
 static OSStatus initHook(AU u) {
     OSStatus r=origInit(u); if(r)return r;
@@ -54,9 +59,31 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         // Coherent snapshot without blocking the real-time thread. If a writer is active, retain prior settings.
         U32 seq=atomic_load(&configSeq);if(!(seq&1u)){float p=atomic_load(&ratio),g=atomic_load(&gain),m=atomic_load(&blend),bands[MF_EQ];U32 e=atomic_load(&eqEnabled);for(unsigned i=0;i<MF_EQ;i++)bands[i]=atomic_load(&eqGain[i]);if(seq==atomic_load(&configSeq)){dspRatio=p;dspGain=g;dspMix=m;dspEq=e;for(unsigned i=0;i<MF_EQ;i++)dspBands[i]=bands[i];}}
         float p=dspRatio,g=dspGain,m=dspMix;mf_config(&dsp,p,dspEq,dspBands,sr);
-        int fx=atomic_load(&enabled), mus=atomic_load(&musicOn);int locked=mus&&pthread_mutex_trylock(&musicLock)==0;float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
+        int fx=atomic_load(&enabled), mus=atomic_load(&musicOn);
+        int pitchMusic=mus&&fx&&atomic_load(&musicPitchEnabled);
+        int boostMusic=mus&&atomic_load(&musicAdvancedGainEnabled);
+        int musicProcessingFlags=(pitchMusic?1:0)|(boostMusic?2:0);
+        if(musicDspGeneration!=gen||musicDspFlags!=musicProcessingFlags){
+            mf_reset(&musicDsp);
+            musicDspGeneration=gen;
+            musicDspFlags=musicProcessingFlags;
+        }
+        if(musicProcessingFlags){
+            const float flatMusicEq[MF_EQ]={0};
+            mf_config(&musicDsp,pitchMusic?p:1.f,0,flatMusicEq,sr);
+        }
+        float musicBoostFactor=boostMusic?atomic_load(&musicAdvancedGain):1.f;
+        int locked=mus&&pthread_mutex_trylock(&musicLock)==0;
+        float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
         int silent=flags&&(*flags&16u);int audible=0;
-        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;if(mus){float z=locked?musicNext(sr):0;y=mf_clip(y*iv+z*mv);if(z!=0)audible=1;}if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
+        if(!silent||mus)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;if(mus){
+            float z=locked?musicNext(sr):0;
+            // Separate processor: music pitch/boost never changes the microphone pitch state.
+            // mf_sample applies a peak limiter after high custom gain to music.
+            if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
+            y=mf_clip(y*iv+z*mv);
+            if(z!=0)audible=1;
+        }if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
         if(locked)pthread_mutex_unlock(&musicLock);if(audible){if(flags)*flags&=~16u;atomic_fetch_add(&musicMixed,1);}
         atomic_fetch_add(&processed,1);
     }atomic_flag_clear(&renderBusy);return r;
@@ -172,12 +199,20 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
         int on=hooked&&getNum(d,"MicFXPitchEnabled")==1.0;float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
         int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
+        int musicPitch=getNum(d,"MicFXMusicPitchEnabled")==1.0;
+        int musicBoost=getNum(d,"MicFXMusicAdvancedGainEnabled")==1.0;
         float customGain=limit(getNum(d,"MicFXAdvancedGainDb"),0,240);
         float effectiveGain=advanced?customGain:g;
+        atomic_store(&musicPitchEnabled,musicPitch);
+        atomic_store(&musicAdvancedGainEnabled,musicBoost);
+        atomic_store(&musicAdvancedGain,powf(10.f,customGain/20.f));
         atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,effectiveGain/20.f));atomic_store(&blend,m/100.f);
         atomic_store(&eqEnabled,getNum(d,"MicFXEQEnabled")==1.0);for(unsigned i=0;i<MF_EQ;i++)atomic_store(&eqGain[i],limit(getNum(d,eqKeys[i]),-12,12));atomic_fetch_add(&configSeq,1);
         if(on!=activeLast){atomic_fetch_add(&generation,1);activeLast=on;}
-        atomic_store(&enabled,on);putNum(d,"MicFXAppliedGainDb",on?effectiveGain:0);U32 now=atomic_load(&processed);const char *status=bootStatus;
+        atomic_store(&enabled,on);putNum(d,"MicFXAppliedGainDb",on?effectiveGain:0);
+        putNum(d,"MicFXMusicAppliedGainDb",musicBoost?customGain:0);
+        putNum(d,"MicFXMusicPitchOn",on&&musicPitch);
+        U32 now=atomic_load(&processed);const char *status=bootStatus;
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
