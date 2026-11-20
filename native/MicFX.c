@@ -233,24 +233,35 @@ static void monitorUpdate(void*d,int hooked){
     unsigned sr=atomic_load(&sampleRate);
     int captured=atomic_load(&capture)!=0;
     static int retry=0;
+    static float previousVolume=-1.f;
+    static const char *previousStatus=0;
+    const char *status=0;
     if(!want){
         if(monQueue)mon_stop();
         retry=0;
-        put(d,"MicFXMonitorStatus","Off (local monitoring disabled)");
+        previousVolume=-1.f;
+        status="Off (local monitoring disabled)";
     }else if(!captured||sr<8000||sr>96000){
         if(monQueue)mon_stop();
-        put(d,"MicFXMonitorStatus","Waiting for Discord microphone; join a VC");
+        previousVolume=-1.f;
+        status="Waiting for Discord microphone; join a VC";
     }else{
-        if(monQueue&&monQueueRate!=sr)mon_stop();
+        if(monQueue&&monQueueRate!=sr){mon_stop();previousVolume=-1.f;}
         if(!monQueue&&((retry++%100)==0)){
-            if(!mon_start(sr,volume)){
-                put(d,"MicFXMonitorStatus","Local AudioQueue failed; try headphones / rejoin VC");
-            }
+            if(mon_start(sr,volume)){previousVolume=volume;retry=0;}
+            else status="Local AudioQueue failed; try headphones / rejoin VC";
         }
         if(monQueue){
-            mon_set_volume(volume);
-            put(d,"MicFXMonitorStatus","Monitoring processed microphone locally; headphones recommended");
-        }
+            if(fabsf(previousVolume-volume)>.0001f){
+                mon_set_volume(volume);
+                previousVolume=volume;
+            }
+            status="Monitoring processed microphone locally; headphones recommended";
+        }else if(!status)status="Local AudioQueue unavailable; retrying";
+    }
+    if(!previousStatus||strcmp(previousStatus,status)){
+        put(d,"MicFXMonitorStatus",status);
+        previousStatus=status;
     }
     putNum(d,"MicFXMonitorRunning",atomic_load(&monRunning));
     putNum(d,"MicFXMonitorRms",atomic_load(&monRms));
