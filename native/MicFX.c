@@ -5,11 +5,14 @@
 #include "pitch.h"
 #include "MusicInput.h"
 #include "APOGroup.h"
+#include "VoiceLevel.h"
+#include <stdbool.h>
+extern void mf_request_stereo_route(bool enabled);
 #include <unistd.h>
 #include <string.h>
 typedef void *AU; typedef int32_t OSStatus; typedef uint32_t U32;
 typedef struct { U32 channels, bytes; void *data; } Buffer;
-typedef struct { U32 count; Buffer buffers[1]; } Buffers;
+typedef struct { U32 count; Buffer buffers[]; } Buffers;
 typedef struct { double rate; U32 format,flags,bytesPacket,framesPacket,bytesFrame,channels,bits,reserved; } ASBD;
 typedef struct { U32 type,subtype,manufacturer,flags,mask; } ComponentDesc;
 typedef struct { U32 magic,cpu,sub,filetype,ncmds,sizeofcmds,flags,reserved; } MachHeader;
@@ -34,7 +37,11 @@ static _Atomic(U32) eqEnabled,configSeq;
 static const char *eqKeys[MF_EQ]={"MicFXEQ0","MicFXEQ1","MicFXEQ2","MicFXEQ3","MicFXEQ4","MicFXEQ5","MicFXEQ6","MicFXEQ7"};
 static float dspRatio=1.f,dspGain=1.f,dspMix=1.f,dspBands[MF_EQ];static U32 dspEq;
 static atomic_flag renderBusy=ATOMIC_FLAG_INIT;
-static MFPitch dsp,musicDsp;
+static MFPitch dsp[2],musicDsp;
+static MFVoiceLevel level;
+static _Atomic(U32) layoutChannels, layoutPlanar, rmsEnabled;
+static _Atomic(float) rmsTarget = .5f;
+static int wasLeveling;
 static U32 dspGeneration,musicDspGeneration;
 static int musicDspFlags=-1;
 static const char *bootStatus="Native bridge not initialized";
@@ -44,22 +51,43 @@ static OSStatus initHook(AU u) {
     ComponentDesc d={0}; ASBD f={0}; U32 size=sizeof(f); void *c=getComp(u);
     if(!c||getDesc(c,&d)||d.type!=FOUR('a','u','o','u')||d.manufacturer!=FOUR('a','p','p','l')||(d.subtype!=FOUR('r','i','o','c')&&d.subtype!=FOUR('v','p','i','o')))return r;
     clearCapture(u);
-    if(getProp(u,8,2,1,&f,&size)||size!=sizeof(f)||f.format!=FOUR('l','p','c','m')||f.channels!=1||f.rate<8000||f.rate>96000||f.framesPacket!=1||(f.flags&2u)||!(f.flags&8u))return r;
-    U32 kind=0;if(f.bits==16&&f.bytesFrame==2&&(f.flags&4u)&&!(f.flags&1u))kind=1;else if(f.bits==32&&f.bytesFrame==4&&(f.flags&1u))kind=2;
+    if(getProp(u,8,2,1,&f,&size)||size!=sizeof(f)||f.format!=FOUR('l','p','c','m')||(f.channels!=1 && f.channels!=2)||f.rate<8000||f.rate>96000||f.framesPacket!=1||(f.flags&2u)||!(f.flags&8u))return r;
+    U32 planar=(f.flags&32u)!=0;
+    U32 stride=planar?1:f.channels;
+    U32 kind=0;if(f.bits==16&&f.bytesFrame==2*stride&&(f.flags&4u)&&!(f.flags&1u))kind=1;else if(f.bits==32&&f.bytesFrame==4*stride&&(f.flags&1u))kind=2;
     if(!kind)return r;
-    atomic_store(&capture,0); atomic_store(&sampleRate,(U32)f.rate);atomic_store(&formatKind,kind);atomic_fetch_add(&generation,1);atomic_store(&capture,(uintptr_t)u);return r;
+    atomic_store(&capture,0); atomic_store(&layoutChannels,f.channels);atomic_store(&layoutPlanar,planar);atomic_store(&sampleRate,(U32)f.rate);atomic_store(&formatKind,kind);atomic_fetch_add(&generation,1);atomic_store(&capture,(uintptr_t)u);return r;
 }
 static OSStatus uninitHook(AU u){clearCapture(u);return origUninit(u);}
 static OSStatus disposeHook(AU u){clearCapture(u);return origDispose(u);}
 static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers *b){
-    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!mf_apo_active())||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
-    U32 fmt=atomic_load(&formatKind),sr=atomic_load(&sampleRate),gen=atomic_load(&generation); if((fmt!=1&&fmt!=2)||sr<8000||sr>96000||b->buffers[0].bytes<n*(fmt==1?2u:4u))return r;
+    OSStatus r=origRender(u,flags,ts,bus,n,b);
+    if(r || bus!=1 || !b || !n || n>4096 || atomic_load(&capture)!=(uintptr_t)u) return r;
+    U32 gen=atomic_load(&generation), fmt=atomic_load(&formatKind), sr=atomic_load(&sampleRate);
+    U32 channels=atomic_load(&layoutChannels), planar=atomic_load(&layoutPlanar);
+    int rms=atomic_load(&rmsEnabled);
+    if(!rms && !atomic_load(&enabled) && !atomic_load(&musicOn) && !mf_apo_active()) return r;
+    if((fmt!=1 && fmt!=2) || sr<8000 || sr>96000 || (channels!=1 && channels!=2)) return r;
+    U32 count=planar?channels:1, stride=planar?1:channels;
+    void *samples[2]={0};
+    if(b->count!=count) return r;
+    for(U32 k=0;k<count;k++){
+        const Buffer *buf=&b->buffers[k];
+        if(!buf->data || buf->channels!=stride || buf->bytes<n*stride*(fmt==1?2u:4u)) return r;
+        samples[k]=buf->data;
+    }
     if(atomic_flag_test_and_set(&renderBusy))return r;
     if(atomic_load(&capture)==(uintptr_t)u&&atomic_load(&generation)==gen){
-        if(dspGeneration!=gen){mf_reset(&dsp);dspGeneration=gen;}
+        if(dspGeneration!=gen){
+            for(U32 ch=0;ch<channels;ch++) mf_reset(&dsp[ch]);
+            mf_level_reset(&level,sr);dspGeneration=gen;
+        }
+        if(rms && !wasLeveling) mf_level_reset(&level,sr);
+        wasLeveling=rms;
+        float target=atomic_load(&rmsTarget);
         // Coherent snapshot without blocking the real-time thread. If a writer is active, retain prior settings.
         U32 seq=atomic_load(&configSeq);if(!(seq&1u)){float p=atomic_load(&ratio),g=atomic_load(&gain),m=atomic_load(&blend),bands[MF_EQ];U32 e=atomic_load(&eqEnabled);for(unsigned i=0;i<MF_EQ;i++)bands[i]=atomic_load(&eqGain[i]);if(seq==atomic_load(&configSeq)){dspRatio=p;dspGain=g;dspMix=m;dspEq=e;for(unsigned i=0;i<MF_EQ;i++)dspBands[i]=bands[i];}}
-        float p=dspRatio,g=dspGain,m=dspMix;mf_config(&dsp,p,dspEq,dspBands,sr);
+        float p=dspRatio,g=dspGain,m=dspMix;for(U32 ch=0;ch<channels;ch++) mf_config(&dsp[ch],p,dspEq,dspBands,sr);
         int fx=atomic_load(&enabled), mus=atomic_load(&musicOn), apo=mf_apo_active();
         mf_apo_prepare(sr);
         int pitchMusic=mus&&fx&&atomic_load(&musicPitchEnabled);
@@ -78,15 +106,32 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         int locked=mus&&pthread_mutex_trylock(&musicLock)==0;
         float mv=atomic_load(&musicVol),iv=atomic_load(&micVol);
         int silent=flags&&(*flags&16u);int audible=0;
-        if(!silent||mus||apo)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;if(apo)y=mf_apo_sample(y);float stereoL=0,stereoR=0;int groupMusic=apo&&mf_apo_music_next(sr,&stereoL,&stereoR);if(mus||groupMusic){
-            float z=mus&&locked?musicNext(sr):0;
-            // Separate processor: music pitch/boost never changes the microphone pitch state.
-            // mf_sample applies a peak limiter after high custom gain to music.
-            if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
-            float independentStereo=groupMusic?(stereoL+stereoR)*.5f*mf_apo_music_gain():0.f;
-            y=mf_clip(y*(mus?iv:1.f)+z*mv+independentStereo);
-            if(z!=0||groupMusic)audible=1;
-        }if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);else ((float*)b->buffers[0].data)[i]=y;}
+        float groupGain=apo?mf_apo_music_gain():0;
+        for(U32 i=0;i<n;i++){
+            float mic[2]={0}, group[2]={0};
+            for(U32 ch=0;ch<channels;ch++){
+                void *src=samples[planar?ch:0];
+                U32 ix=i*stride+(planar?0:ch);
+                float x=silent?0:fmt==1?((int16_t*)src)[ix]/32768.f:((float*)src)[ix];
+                if(!isfinite(x)) x=0;
+                float y=fx?mf_sample(&dsp[ch],x,p,g,m,sr):x;
+                mic[ch]=apo?mf_apo_sample(y,ch,channels):y;
+            }
+            if(rms) mf_level_frame(&level,mic,target);
+            int groupMusic=apo && mf_apo_music_next(sr,&group[0],&group[1]);
+            float z=mus && locked?musicNext(sr):0;
+            if(musicProcessingFlags) z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
+            if(z!=0 || groupMusic) audible=1;
+            for(U32 ch=0;ch<channels;ch++){
+                float side=channels==2?group[ch]:(group[0]+group[1])*.5f;
+                float y=mic[ch]*(mus?iv:1.f)+z*mv+side*groupGain;
+                y=mf_clip(y);
+                U32 ix=i*stride+(planar?0:ch);
+                void *dest=samples[planar?ch:0];
+                if(fmt==1)((int16_t*)dest)[ix]=(int16_t)(y>=0?y*32767.f:y*32768.f);
+                else ((float*)dest)[ix]=y;
+            }
+        }
         if(locked)pthread_mutex_unlock(&musicLock);if(audible){if(flags)*flags&=~16u;atomic_fetch_add(&musicMixed,1);}
         atomic_fetch_add(&processed,1);
     }atomic_flag_clear(&renderBusy);return r;
@@ -201,6 +246,14 @@ static float limit(double v,float lo,float hi){return !(v>=lo)?lo:v>hi?hi:(float
 static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U32 prev=0;int activeLast=0;double lastRequest=-1; int lastOn=-1; U32 lastCapture=0; int hold=0;
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
         int on=hooked&&getNum(d,"MicFXPitchEnabled")==1.0;float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
+        int rms=hooked && getNum(d,"MicFXRmsEnabled")==1;
+        static int lastRms=-1,lastStereo=-1;
+        if(rms!=lastRms){atomic_fetch_add(&generation,1);lastRms=rms;}
+        atomic_store(&rmsEnabled,rms);
+        float targetDb=limit(getNum(d,"MicFXRmsTargetDb"),-24,-3);
+        atomic_store(&rmsTarget,powf(10.f,targetDb/20.f));
+        int stereo=getNum(d,"MicFXStereoRequested")==1;
+        if(stereo!=lastStereo){mf_request_stereo_route(stereo);lastStereo=stereo;}
         int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
         int musicPitch=getNum(d,"MicFXMusicPitchEnabled")==1.0;
         int musicBoost=getNum(d,"MicFXMusicAdvancedGainEnabled")==1.0;
@@ -218,8 +271,12 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         U32 now=atomic_load(&processed);const char *status=bootStatus;
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
-        if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
-        if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
+        if(hooked){if(!cap)status="Ready for mono or stereo microphone";else if(!on&&!rms)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
+        static U32 previousChannels=99;
+        U32 activeChannels=cap?atomic_load(&layoutChannels):0;
+        if(request!=lastRequest||on!=lastOn||cap!=lastCapture||activeChannels!=previousChannels){
+            putNum(d,"MicFXVoiceChannels",activeChannels);previousChannels=activeChannels;
+            putNum(d,"MicFXVoiceLevelVersion",1);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
         if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;if(dir)musicRead(dir);else musicReset();put(d,"MicFXMusicStatus",!dir?"App Group denied":allowMix?(atomic_load(&musicMixHooks)?"Group accessible; music-session mixing requested":"Group accessible; session mixing hooks unavailable"):"Group accessible; session mixing option off");}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));putNum(d,"MicFXAPOSettingsApplied",mf_apo_settings_updates());putNum(d,"MicFXAPOStereoPackets",mf_apo_music_packets());putNum(d,"MicFXAPOVersion",5);putNum(d,"MicFXAPOReadState",mf_apo_read_state());putNum(d,"MicFXAPOWorkerTicks",mf_apo_worker_ticks());poolPop(pool);usleep(20000);
     }return 0;
 }

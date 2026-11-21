@@ -9,7 +9,7 @@ extern "C" {
 void mf_apo_start(void);
 int mf_apo_active(void);
 void mf_apo_prepare(unsigned sampleRate); // once per AudioUnit render block
-float mf_apo_sample(float rawMic);         // realtime, no alloc/IO/locks
+float mf_apo_sample(float rawMic, unsigned channel, unsigned channels);         // realtime, no alloc/IO/locks
 // Stereo 48kHz 20ms packets from an authorized sender, downmixed only when
 // Discord exposes a mono outgoing AudioUnit.
 int mf_apo_music_next(unsigned sampleRate,float* left,float* right);

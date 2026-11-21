@@ -36,6 +36,7 @@ struct RtBiquad {
  float b0=1,b1=0,b2=0,a1=0,a2=0,z1=0,z2=0;
 };
 static RtBiquad dsp;
+static float delay1[2], delay2[2], channelLevel[2];
 static uint32_t dspRevision=0;
 static bool dspEnabled=false,dspMuted=false;
 static float dspLevel=1;
@@ -182,7 +183,10 @@ extern "C" void mf_apo_prepare(unsigned sr) {
  // The outgoing AudioUnit is mono. A one-sided mic route is halved in mono.
  float l=micLeft.load(std::memory_order_relaxed),r=micRight.load(std::memory_order_relaxed);
  float db=preampDb.load(std::memory_order_relaxed);
- dspLevel=std::pow(10.f,db/20.f)*.5f*(l+r);
+ const float gainFactor=std::pow(10.f,db/20.f);
+ channelLevel[0]=gainFactor*l;channelLevel[1]=gainFactor*r;
+ dspLevel=gainFactor*.5f*(l+r);
+ std::fill_n(delay1,2,0.f);std::fill_n(delay2,2,0.f);
  dspType=filterType.load(std::memory_order_relaxed);
  dsp=RtBiquad();
  if(!dspEnabled||!dspType||sr<8000||sr>96000)return;
@@ -208,17 +212,17 @@ extern "C" void mf_apo_prepare(unsigned sr) {
  if(std::fabs(a0)<1e-8f||!std::isfinite(a0))return;
  dsp.b0=b0/a0;dsp.b1=b1/a0;dsp.b2=b2/a0;dsp.a1=a1/a0;dsp.a2=a2/a0;
 }
-extern "C" float mf_apo_sample(float x) {
+extern "C" float mf_apo_sample(float x,unsigned channel,unsigned channels) {
  if(!dspEnabled)return x;
  if(dspMuted)return 0;
  float v=x;
  if(dspType&&dspRate){
-  float y=dsp.b0*v+dsp.z1;
-  dsp.z1=dsp.b1*v-dsp.a1*y+dsp.z2;
-  dsp.z2=dsp.b2*v-dsp.a2*y;
+  float y=dsp.b0*v+delay1[channel];
+  delay1[channel]=dsp.b1*v-dsp.a1*y+delay2[channel];
+  delay2[channel]=dsp.b2*v-dsp.a2*y;
   v=y;
  }
- v*=dspLevel;
+ v*=channels==2?channelLevel[channel]:dspLevel;
  // bounded soft limiter: prevents mic clipping at positive dB levels
  return std::isfinite(v)?std::tanh(v):0;
 }
