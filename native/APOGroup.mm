@@ -23,7 +23,7 @@ struct Packet {
 };
 static_assert(sizeof(Packet)==3888,"Stereo transport ABI mismatch");
 
-static std::atomic<unsigned> settingsUpdates{0}, musicUpdates{0};
+static std::atomic<unsigned> settingsUpdates{0}, musicUpdates{0},readState{0},workerTicks{0};
 static std::atomic<int> enabled{0},muteMic{0},filterType{0};
 static std::atomic<float> preampDb{0},musicDb{-12},micLeft{1},micRight{1},
                           frequency{1000},filterGain{0},quality{1};
@@ -85,13 +85,15 @@ static void pushPacket(const Packet& p) {
 static void updateSettings(NSURL* root) {
  NSURL* file=[root URLByAppendingPathComponent:@"micfx-control-v1.json"];
  NSData* raw=[NSData dataWithContentsOfURL:file options:0 error:nil];
- if(!raw||raw.length>65536)return;
+ if(!raw){readState.store(2,std::memory_order_relaxed);return;}
+ if(raw.length>65536){readState.store(3,std::memory_order_relaxed);return;}
  id parsed=[NSJSONSerialization JSONObjectWithData:raw options:0 error:nil];
- if(![parsed isKindOfClass:[NSDictionary class]])return;
+ if(![parsed isKindOfClass:[NSDictionary class]]){readState.store(3,std::memory_order_relaxed);return;}
  NSDictionary* data=(NSDictionary*)parsed;
- if(![data[@"schema"] isEqual:@1])return;
+ if(![data[@"schema"] isEqual:@1]){readState.store(3,std::memory_order_relaxed);return;}
  NSDictionary* mic=data[@"mic"],*mus=data[@"music"];
- if(![mic isKindOfClass:[NSDictionary class]]||![mus isKindOfClass:[NSDictionary class]])return;
+ if(![mic isKindOfClass:[NSDictionary class]]||![mus isKindOfClass:[NSDictionary class]]){readState.store(3,std::memory_order_relaxed);return;}
+ readState.store(4,std::memory_order_release);
  bool nextEnabled=[mic[@"enabled"] respondsToSelector:@selector(boolValue)]&&[mic[@"enabled"] boolValue];
  bool nextMute=[mic[@"mute"] respondsToSelector:@selector(boolValue)]&&[mic[@"mute"] boolValue];
  const float nextDb=static_cast<float>(numeric(mic[@"gainDb"],-90,24,0));
@@ -141,7 +143,8 @@ static void worker(void) {
    if(root){
     updateSettings(root);
     if(enabled.load(std::memory_order_relaxed))updateMusic(root);
-   }
+   }else readState.store(1,std::memory_order_relaxed);
+   workerTicks.fetch_add(1,std::memory_order_relaxed);
   }
   usleep(25000);
  }
@@ -160,6 +163,12 @@ extern "C" unsigned mf_apo_settings_updates(void) {
 }
 extern "C" unsigned mf_apo_music_packets(void) {
  return musicUpdates.load(std::memory_order_relaxed);
+}
+extern "C" unsigned mf_apo_read_state(void) {
+ return readState.load(std::memory_order_acquire);
+}
+extern "C" unsigned mf_apo_worker_ticks(void) {
+ return workerTicks.load(std::memory_order_relaxed);
 }
 extern "C" float mf_apo_music_gain(void) {
  return std::pow(10.f,musicDb.load(std::memory_order_relaxed)/20.f);
