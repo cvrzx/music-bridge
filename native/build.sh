@@ -9,7 +9,14 @@ COMMON=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fPIC -fvis
 xcrun --sdk iphoneos clang "${COMMON[@]}" -std=c11 -Wall -Wextra -c MicFX.c -o ../build/native/MicFX.o
 xcrun --sdk iphoneos clang "${COMMON[@]}" -fobjc-arc -fblocks -Wall -Wextra -c MicRecorder.m -o ../build/native/MicRecorder.o
 xcrun --sdk iphoneos clang++ "${COMMON[@]}" -std=c++17 -fobjc-arc -fblocks -Wall -Wextra -c APOGroup.mm -o ../build/native/APOGroup.o
-xcrun --sdk iphoneos clang++ "${COMMON[@]}" -dynamiclib ../build/native/MicFX.o ../build/native/MicRecorder.o ../build/native/APOGroup.o -framework UIKit -framework QuickLook -framework Foundation -framework AVFoundation -framework AudioToolbox -Wl,-install_name,@rpath/MicFX.dylib -o ../MicFX.dylib
+# Keep Shine's LGPL-2.0 source in vendor/shine for redistribution and relinking.
+SHINE_OBJECTS=()
+for source in vendor/shine/*.c; do
+  obj="../build/native/shine_$(basename "${source%.c}").o"
+  xcrun --sdk iphoneos clang "${COMMON[@]}" -std=c11 -Wall -Wextra -Ivendor/shine -c "$source" -o "$obj"
+  SHINE_OBJECTS+=("$obj")
+done
+xcrun --sdk iphoneos clang++ "${COMMON[@]}" -dynamiclib ../build/native/MicFX.o ../build/native/MicRecorder.o ../build/native/APOGroup.o "${SHINE_OBJECTS[@]}" -framework UIKit -framework QuickLook -framework Foundation -framework AVFoundation -framework AudioToolbox -Wl,-install_name,@rpath/MicFX.dylib -o ../MicFX.dylib
 file ../MicFX.dylib
 xcrun lipo ../MicFX.dylib -verify_arch arm64
 if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
@@ -17,4 +24,9 @@ if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
   trap 'rm -rf "$rec_test_dir"' EXIT
   xcrun --sdk macosx clang -isysroot "$(xcrun --sdk macosx --show-sdk-path)" tests/record_mp4.c -framework AudioToolbox -framework CoreFoundation -o "$rec_test_dir/test_record"
   "$rec_test_dir/test_record" "$rec_test_dir/MicFX-test.mp4"
+  xcrun --sdk macosx clang -std=c11 -O2 -Ivendor/shine tests/mp3_encode.c vendor/shine/*.c -lm -o "$rec_test_dir/test_mp3"
+  "$rec_test_dir/test_mp3" "$rec_test_dir/MicFX-test.mp3"
+  test -s "$rec_test_dir/MicFX-test.mp3"
+  echo "MP3 header: $(od -An -tx1 -N4 "$rec_test_dir/MicFX-test.mp3")"
+  if command -v afinfo >/dev/null; then afinfo "$rec_test_dir/MicFX-test.mp3" >/dev/null; fi
 fi
