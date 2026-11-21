@@ -27,4 +27,16 @@ static inline void mf_level_frame(MFVoiceLevel *s, float mic[2], float target) {
     mic[0] *= scale;
     mic[1] *= scale;
 }
+// Capture and final-mix limiters use one gain per stereo frame. The peak
+// envelope has instant attack and a 90 ms release; signals beneath the ceiling
+// stay linear. Very large dB requests can use INFINITY as an unbounded drive:
+// only the finite gain allowed by the current signal is ever applied.
+static inline void mf_protect(float frame[2], double drive, double *held, double release) {
+    double peak=fmax(fabs((double)frame[0]),fabs((double)frame[1]));
+    *held=fmax(peak,*held*release);
+    if(peak==0) return;
+    double gain=fmin(drive,.98855 / *held);
+    frame[0]=(float)((double)frame[0]*gain);
+    frame[1]=(float)((double)frame[1]*gain);
+}
 #endif

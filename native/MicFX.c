@@ -6,6 +6,8 @@
 #include "MusicInput.h"
 #include "APOGroup.h"
 #include "VoiceLevel.h"
+#include "VoicePan.h"
+extern void mf_install_call_controls(void);
 #include <stdbool.h>
 extern void mf_request_stereo_route(bool enabled);
 #include <unistd.h>
@@ -39,6 +41,9 @@ static float dspRatio=1.f,dspGain=1.f,dspMix=1.f,dspBands[MF_EQ];static U32 dspE
 static atomic_flag renderBusy=ATOMIC_FLAG_INIT;
 static MFPitch dsp[2],musicDsp;
 static MFVoiceLevel level;
+static _Atomic(int) voiceSide,musicSide,cleanBoostOn;
+static _Atomic(double) cleanDrive=1;
+static double micHeld,mixHeld,releaseFactor;
 static _Atomic(U32) layoutChannels, layoutPlanar, rmsEnabled;
 static _Atomic(float) rmsTarget = .5f;
 static int wasLeveling;
@@ -66,7 +71,10 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
     U32 gen=atomic_load(&generation), fmt=atomic_load(&formatKind), sr=atomic_load(&sampleRate);
     U32 channels=atomic_load(&layoutChannels), planar=atomic_load(&layoutPlanar);
     int rms=atomic_load(&rmsEnabled);
-    if(!rms && !atomic_load(&enabled) && !atomic_load(&musicOn) && !mf_apo_active()) return r;
+    int panMic=atomic_load(&voiceSide), panMusic=atomic_load(&musicSide);
+    int boost=atomic_load(&cleanBoostOn);
+    double drive=atomic_load(&cleanDrive);
+    if(!boost && !rms && !panMic && !atomic_load(&enabled) && !atomic_load(&musicOn) && !mf_apo_active()) return r;
     if((fmt!=1 && fmt!=2) || sr<8000 || sr>96000 || (channels!=1 && channels!=2)) return r;
     U32 count=planar?channels:1, stride=planar?1:channels;
     void *samples[2]={0};
@@ -80,7 +88,7 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
     if(atomic_load(&capture)==(uintptr_t)u&&atomic_load(&generation)==gen){
         if(dspGeneration!=gen){
             for(U32 ch=0;ch<channels;ch++) mf_reset(&dsp[ch]);
-            mf_level_reset(&level,sr);dspGeneration=gen;
+            mf_level_reset(&level,sr);micHeld=mixHeld=0;releaseFactor=exp(-1./(.09*sr));dspGeneration=gen;
         }
         if(rms && !wasLeveling) mf_level_reset(&level,sr);
         wasLeveling=rms;
@@ -118,14 +126,22 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
                 mic[ch]=apo?mf_apo_sample(y,ch,channels):y;
             }
             if(rms) mf_level_frame(&level,mic,target);
+            if(boost) mf_protect(mic,drive,&micHeld,releaseFactor);
             int groupMusic=apo && mf_apo_music_next(sr,&group[0],&group[1]);
             float z=mus && locked?musicNext(sr):0;
             if(musicProcessingFlags) z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
             if(z!=0 || groupMusic) audible=1;
+            float bed[2]={z*mv+group[0]*groupGain,z*mv+group[1]*groupGain};
+            if(channels==2){mf_pan_pair(mic,panMic);mf_pan_pair(bed,panMusic);}
+            float mixed[2]={0};
             for(U32 ch=0;ch<channels;ch++){
-                float side=channels==2?group[ch]:(group[0]+group[1])*.5f;
-                float y=mic[ch]*(mus?iv:1.f)+z*mv+side*groupGain;
-                y=mf_clip(y);
+                float music=channels==2?bed[ch]:(bed[0]+bed[1])*.5f;
+                mixed[ch]=mic[ch]*(mus?iv:1.f)+music;
+                if(!isfinite(mixed[ch])) mixed[ch]=0;
+            }
+            mf_protect(mixed,1,&mixHeld,releaseFactor);
+            for(U32 ch=0;ch<channels;ch++){
+                float y=mixed[ch];
                 U32 ix=i*stride+(planar?0:ch);
                 void *dest=samples[planar?ch:0];
                 if(fmt==1)((int16_t*)dest)[ix]=(int16_t)(y>=0?y*32767.f:y*32768.f);
@@ -247,11 +263,19 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
     for(;;){void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));
         int on=hooked&&getNum(d,"MicFXPitchEnabled")==1.0;float p=limit(getNum(d,"MicFXPitchSemitones"),-12,12),dt=limit(getNum(d,"MicFXPitchDetune"),-100,100),g=limit(getNum(d,"MicFXPitchGain"),-12,12),m=limit(getNum(d,"MicFXPitchBlend"),0,100);
         int rms=hooked && getNum(d,"MicFXRmsEnabled")==1;
+        int boost=hooked && getNum(d,"MicFXCleanBoostOn")==1;
+        double db=getNum(d,"MicFXCleanGainDb");
+        if(!isfinite(db)) db=0;
+        // A gain above 10^300 exceeds what any float PCM input can use.
+        atomic_store(&cleanDrive,db>=6000?INFINITY:pow(10.,db/20.));
+        atomic_store(&cleanBoostOn,boost);
         static int lastRms=-1,lastStereo=-1;
         if(rms!=lastRms){atomic_fetch_add(&generation,1);lastRms=rms;}
         atomic_store(&rmsEnabled,rms);
         float targetDb=limit(getNum(d,"MicFXRmsTargetDb"),-24,-3);
         atomic_store(&rmsTarget,powf(10.f,targetDb/20.f));
+        atomic_store(&voiceSide,(int)limit(getNum(d,"MicFXVoiceSide"),-1,1));
+        atomic_store(&musicSide,(int)limit(getNum(d,"MicFXMusicSide"),-1,1));
         int stereo=getNum(d,"MicFXStereoRequested")==1;
         if(stereo!=lastStereo){mf_request_stereo_route(stereo);lastStereo=stereo;}
         int advanced=getNum(d,"MicFXAdvancedGainEnabled")==1.0;
@@ -271,7 +295,7 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         U32 now=atomic_load(&processed);const char *status=bootStatus;
         if(now!=prev)hold=25;else if(hold>0)hold--;
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
-        if(hooked){if(!cap)status="Ready for mono or stereo microphone";else if(!on&&!rms)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
+        if(hooked){if(!cap)status="Ready for mono or stereo microphone";else if(!on&&!rms&&!boost)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
         static U32 previousChannels=99;
         U32 activeChannels=cap?atomic_load(&layoutChannels):0;
         if(request!=lastRequest||on!=lastOn||cap!=lastCapture||activeChannels!=previousChannels){
@@ -283,5 +307,5 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
     // Ensure stale settings cannot enable processing on app launch, even after a previous crash.
     void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
-    mf_apo_start();int hooked=install();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
+    mf_install_call_controls();mf_apo_start();int hooked=install();pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
 }
