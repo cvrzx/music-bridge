@@ -10,6 +10,7 @@
 #include "MicMonitor.h"
 #include "RecordBuffer.h"
 #include "MusicInput.h"
+#include "APOGroup.h"
 #include <unistd.h>
 #include <string.h>
 typedef void *AU; typedef int32_t OSStatus; typedef uint32_t U32;
@@ -73,7 +74,7 @@ static OSStatus initHook(AU u) {
 static OSStatus uninitHook(AU u){clearCapture(u);return origUninit(u);}
 static OSStatus disposeHook(AU u){clearCapture(u);return origDispose(u);}
 static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers *b){
-    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!atomic_load(&monFeedOn)&&!atomic_load(&mfRec.armed))||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
+    OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!atomic_load(&monFeedOn)&&!atomic_load(&mfRec.armed)&&!mf_apo_active())||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
     U32 fmt=atomic_load(&formatKind),sr=atomic_load(&sampleRate),gen=atomic_load(&generation); if((fmt!=1&&fmt!=2)||sr<8000||sr>96000||b->buffers[0].bytes<n*(fmt==1?2u:4u))return r;
     if(atomic_flag_test_and_set(&renderBusy))return r;
     if(atomic_load(&capture)==(uintptr_t)u&&atomic_load(&generation)==gen){
@@ -103,7 +104,8 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         mf_config(&dsp,p,dspEq,dspBands,sr);
         float loud=atomic_load(&loudAmount),color=atomic_load(&voiceColor);
         float loudBoost=loud>0.f?powf(10.f,loud*.45f/20.f):1.f;
-        int fx=atomic_load(&enabled), mus=atomic_load(&musicOn);
+        int fx=atomic_load(&enabled), mus=atomic_load(&musicOn),apo=mf_apo_active();
+        if(apo)mf_apo_prepare(sr);
         int pitchMusic=mus&&pitchEnabledNow&&atomic_load(&musicPitchEnabled);
         int boostMusic=mus&&atomic_load(&musicAdvancedGainEnabled);
         int musicProcessingFlags=(pitchMusic?1:0)|(boostMusic?2:0);
@@ -124,11 +126,12 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         uint64_t monitorWrite=monitoring?atomic_load_explicit(&monWrite,memory_order_relaxed):0;
         MFRecordBlock *record=mf_rec_begin(n,sr);
         float monitorPower=0.f,monitorPeak=0.f;
-        if(!silent||mus||monitoring||record)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
+        if(!silent||mus||apo||monitoring||record)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
             if(fx&&(loud>0.f||color>0.f))y=mf_loud_sample(&loudVoice,y,loudBoost,loud,color,sr);
             if(drum)y=drum_sample(&drumShape,y);
             if(tone)y=tone_sample(&toneEQ,y);
-            if(record)record->samples[i]=mon_clip(y);
+            if(apo)y=mf_apo_sample(y);
+            float micRecordSample=mon_clip(y);
             /* Local preview taps the processed microphone only, before Spotify.
                Does not duplicate/re-route anything into the voice encoder. */
             if(monitoring){
@@ -137,15 +140,20 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
                 monitorPower+=voice*voice;
                 float peak=fabsf(voice);if(peak>monitorPeak)monitorPeak=peak;
             }
-            if(mus){
-            float z=locked?musicNext(sr):0;
-            // Separate processor: music pitch/boost never changes the microphone pitch state.
-            // mf_sample applies a peak limiter after high custom gain to music.
-            if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
-            y=mf_clip(y*iv+z*mv);
-            if(z!=0)audible=1;
-        }
-            if(fx||mus||monitoring){
+            float stereoLeft=0.f,stereoRight=0.f;
+            int apoPacket=apo&&mf_apo_music_next(sr,&stereoLeft,&stereoRight);
+            if(mus||apoPacket){
+                float z=mus&&locked?musicNext(sr):0.f;
+                // Music effects are separate from the microphone processor.
+                if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
+                // Discord exposes a mono outgoing AudioUnit here. Stereo is mixed, then downmixed.
+                float apoMono=apoPacket?(stereoLeft+stereoRight)*0.5f*mf_apo_music_gain():0.f;
+                y=mf_clip(y*(mus?iv:1.f)+z*mv+apoMono);
+                if(z!=0.f||apoPacket)audible=1;
+            }
+            // Legacy mic-only default remains unchanged. Opt in to the actual outgoing mix.
+            if(record)record->samples[i]=mf_rec_wants_music()?mon_clip(y):micRecordSample;
+            if(fx||mus||apo||monitoring){
                 if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);
                 else ((float*)b->buffers[0].data)[i]=y;
             }
@@ -371,12 +379,12 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         put(d,"MicFXMusicStatus",readerStatus);}else {musicReset();put(d,"MicFXMusicStatus","Off");}putNum(d,"MicFXMusicPackets",atomic_load(&musicPackets));putNum(d,"MicFXMusicMixed",atomic_load(&musicMixed));
         putNum(d,"MicFXMusicReadState",atomic_load(&musicReadState));putNum(d,"MicFXMusicFiles",atomic_load(&musicFileCount));
         putNum(d,"MicFXMusicInvalid",atomic_load(&musicInvalidCount));putNum(d,"MicFXMusicStale",atomic_load(&musicStaleCount));
-        putNum(d,"MicFXMusicPacketAgeMs",atomic_load(&musicNewestAge));monitorUpdate(d,hooked);poolPop(pool);usleep(20000);
+        putNum(d,"MicFXMusicPacketAgeMs",atomic_load(&musicNewestAge));putNum(d,"MicFXAPOVersion",5);putNum(d,"MicFXAPOSettingsApplied",mf_apo_settings_updates());putNum(d,"MicFXAPOStereoPackets",mf_apo_music_packets());putNum(d,"MicFXAPOReadState",mf_apo_read_state());putNum(d,"MicFXAPOWorkerTicks",mf_apo_worker_ticks());monitorUpdate(d,hooked);poolPop(pool);usleep(20000);
     }return 0;
 }
 __attribute__((constructor)) static void start(void){getClass=SYM("objc_getClass");sel=SYM("sel_registerName");msg=SYM("objc_msgSend");poolPush=SYM("objc_autoreleasePoolPush");poolPop=SYM("objc_autoreleasePoolPop");if(!getClass||!sel||!msg||!poolPush||!poolPop)return;
     // Ensure stale settings cannot enable processing on app launch, even after a previous crash.
     void *pool=poolPush();void *d=((void*(*)(void*,void*))msg)(getClass("NSUserDefaults"),sel("standardUserDefaults"));put(d,"MicFXPitchEnabled","0");/* Preserve saved music bridge preference across app restarts. */putNum(d,"MicFXBasiqEnabled",0);putNum(d,"MicFXBasiqAck",0);putNum(d,"MicFXDrumsEnabled",0);putNum(d,"MicFXDrumsAck",0);putNum(d,"MicFXNativeAck",0);putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",0);putNum(d,"MicFXNativeOn",0);put(d,"MicFXPitchStatus","Native processor starting");poolPop(pool);
-    int hooked=install();mf_rec_service_start(hooked);pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
+    mf_apo_start();int hooked=install();mf_rec_service_start(hooked);pthread_t t;if(!pthread_create(&t,0,poll,(void*)(intptr_t)hooked))pthread_detach(t);
 }
 
