@@ -3,6 +3,9 @@
 #import <QuickLook/QuickLook.h>
 #import "RecordBuffer.h"
 #import "RecordFile.h"
+#import "vendor/shine/layer3.h"
+#include <stdio.h>
+#include <stdint.h>
 #import <math.h>
 
 MFRecordBuffer mfRec;
@@ -19,6 +22,11 @@ static dispatch_source_t timer;
 static NSString *session,*finishReason;
 static NSURL *folder,*scratchURL,*finalURL,*previewURL;
 static ExtAudioFileRef encoder;
+static shine_t mp3Encoder;
+static FILE *mp3File;
+static int mp3Pass,mp3Filled;
+static int16_t mp3Samples[SHINE_MAX_SAMPLES];
+static BOOL wantsMP3;
 static unsigned captureRate;
 static uint64_t framesWritten;
 static NSTimeInterval lastData;
@@ -41,7 +49,7 @@ static void refreshList(void){
     NSArray<NSString *> *names=[[NSFileManager defaultManager] contentsOfDirectoryAtPath:folder.path error:nil];
     NSMutableArray<NSString *> *files=[NSMutableArray array];
     for(NSString *n in names){
-        if([n hasPrefix:@"MicFX-"]&&[n.pathExtension isEqualToString:@"mp4"])[files addObject:n];
+        if([n hasPrefix:@"MicFX-"]&&([n.pathExtension isEqualToString:@"mp4"]||[n.pathExtension isEqualToString:@"mp3"]))[files addObject:n];
     }
     [files sortUsingComparator:^NSComparisonResult(NSString *a,NSString *b){return [b compare:a];}];
     [prefs setObject:files forKey:@"MicFXRecordFiles"];
@@ -49,8 +57,8 @@ static void refreshList(void){
 static NSString *newName(void){
     NSDateFormatter *f=[NSDateFormatter new];f.locale=[NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
     f.timeZone=NSTimeZone.localTimeZone;f.dateFormat=@"yyyy-MM-dd HH-mm-ss";
-    return [NSString stringWithFormat:@"MicFX-%@-%@.mp4",[f stringFromDate:NSDate.date],
-            [NSUUID.UUID.UUIDString substringToIndex:8]];
+    return [NSString stringWithFormat:@"MicFX-%@-%@.%@",[f stringFromDate:NSDate.date],
+            [NSUUID.UUID.UUIDString substringToIndex:8],wantsMP3?@"mp3":@"mp4"];
 }
 static void beginTake(void){
     if(!hookAvailable||mf_rec_capture_rate()==0){idle(@"Join a voice call with Discord’s microphone active, then tap Record.");return;}
@@ -69,12 +77,60 @@ static void stopTake(NSString *reason){
     finishReason=reason;
     state(MFFinishing,@"finishing");status(@"Finishing MP4…");
 }
+// Shine MP3 encoding runs only on this serial recorder worker, never in the AudioUnit callback.
+static BOOL mp3WritePacket(const unsigned char *p,int n){
+    if(n<0||!mp3File)return NO;
+    return n==0||(p&&fwrite(p,1,(size_t)n,mp3File)==(size_t)n);
+}
+static BOOL mp3Push(const float *in,unsigned count){
+    if(!mp3Encoder||!mp3File||mp3Pass<=0)return NO;
+    for(unsigned i=0;i<count;i++){
+        const float x=fmaxf(-1.f,fminf(1.f,in[i]));
+        mp3Samples[mp3Filled++]=(int16_t)lrintf(x*32767.f);
+        if(mp3Filled==mp3Pass){
+            int n=0;unsigned char *packet=shine_encode_buffer_interleaved(mp3Encoder,mp3Samples,&n);
+            if(!mp3WritePacket(packet,n))return NO;
+            mp3Filled=0;
+        }
+    }
+    return YES;
+}
+static BOOL mp3Finish(void){
+    BOOL ok=YES;
+    if(mp3Encoder){
+        if(mp3Filled){
+            while(mp3Filled<mp3Pass)mp3Samples[mp3Filled++]=0;
+            int n=0;unsigned char *packet=shine_encode_buffer_interleaved(mp3Encoder,mp3Samples,&n);
+            if(!mp3WritePacket(packet,n))ok=NO;
+            mp3Filled=0;
+        }
+        int n=0;unsigned char *last=shine_flush(mp3Encoder,&n);
+        if(!mp3WritePacket(last,n))ok=NO;
+        shine_close(mp3Encoder);mp3Encoder=NULL;
+    }
+    if(mp3File){if(fflush(mp3File)!=0)ok=NO;if(fclose(mp3File)!=0)ok=NO;mp3File=NULL;}
+    return ok;
+}
+static BOOL mp3Open(NSURL *url,unsigned sampleRate){
+    shine_config_t config={0};
+    config.wave.channels=PCM_MONO;config.wave.samplerate=(int)sampleRate;
+    shine_set_config_mpeg_defaults(&config.mpeg);
+    config.mpeg.mode=MONO;config.mpeg.bitr=128;
+    if(shine_check_config(config.wave.samplerate,config.mpeg.bitr)<0)return NO;
+    mp3Encoder=shine_initialise(&config);
+    if(!mp3Encoder)return NO;
+    mp3Pass=shine_samples_per_pass(mp3Encoder);mp3Filled=0;
+    if(mp3Pass<=0||mp3Pass>SHINE_MAX_SAMPLES){shine_close(mp3Encoder);mp3Encoder=NULL;return NO;}
+    mp3File=fopen(url.fileSystemRepresentation,"wb");
+    if(!mp3File){shine_close(mp3Encoder);mp3Encoder=NULL;return NO;}
+    return YES;
+}
 static void pump(void){
     uint32_t t=atomic_load(&mfRec.tail),h=atomic_load(&mfRec.head);
     while(t!=h){
         MFRecordBlock *b=&mfRec.blocks[t%MF_REC_SLOTS];
         if(!writerFailed){
-            OSStatus e=mf_rec_write(encoder,b->samples,b->frames);
+            OSStatus e=wantsMP3?(mp3Push(b->samples,b->frames)?0:-1):mf_rec_write(encoder,b->samples,b->frames);
             if(e)writerFailed=YES;
             else {framesWritten+=b->frames;lastData=NSProcessInfo.processInfo.systemUptime;}
         }
@@ -85,8 +141,10 @@ static void pump(void){
 }
 static void finishTake(void){
     if(atomic_load(&mfRec.writing))return;
-    if(encoder){
-        pump();if(ExtAudioFileDispose(encoder))writerFailed=YES;encoder=NULL;
+    if(encoder||mp3File||mp3Encoder){
+        pump();
+        if(encoder){if(ExtAudioFileDispose(encoder))writerFailed=YES;encoder=NULL;}
+        if(mp3File||mp3Encoder){if(!mp3Finish())writerFailed=YES;}
     }
     NSError *error=nil;
     BOOL saved=!writerFailed&&framesWritten&&[NSFileManager.defaultManager moveItemAtURL:scratchURL toURL:finalURL error:&error];
@@ -106,7 +164,7 @@ static void advanceTake(void){
         if(!captureRate){stopTake(nil);return;}
         finalURL=[folder URLByAppendingPathComponent:newName()];
         scratchURL=[finalURL URLByAppendingPathExtension:@"partial"];
-        if(mf_rec_open((__bridge CFURLRef)scratchURL,captureRate,&encoder)){
+        if(wantsMP3?!mp3Open(scratchURL,captureRate):mf_rec_open((__bridge CFURLRef)scratchURL,captureRate,&encoder)!=noErr){
             writerFailed=YES;stopTake(nil);return;
         }
         atomic_store(&mfRec.rate,captureRate);
@@ -117,7 +175,7 @@ static void advanceTake(void){
     if(phase==MFTaking){
         BOOL first=framesWritten==0;
         pump();
-        if(first&&framesWritten)status(atomic_load(&includeReceivedMusic)?@"Recording processed mic + received music.":@"Recording your processed mic.");
+        if(first&&framesWritten)status(atomic_load(&includeReceivedMusic)?(wantsMP3?@"Recording MP3: processed mic + received music.":@"Recording MP4: processed mic + received music."):(wantsMP3?@"Recording processed mic to MP3.":@"Recording your processed mic."));
         if(writerFailed||atomic_load(&mfRec.interrupted)||!mf_rec_capture_rate()||
            now-lastData>(framesWritten?3:5))stopTake(@"Saved up to the microphone interruption.");
     }
@@ -190,12 +248,12 @@ static void command(void){
     NSString *action=c[@"action"];
     if([action isEqual:@"stop"]&&(phase==MFArming||phase==MFTaking)){stopTake(nil);return;}
     if(phase!=MFIdle)return;
-    if([action isEqual:@"start"]){atomic_store(&includeReceivedMusic,[c[@"includeMusic"] integerValue]==1);beginTake();return;}
+    if([action isEqual:@"start"]){atomic_store(&includeReceivedMusic,[c[@"includeMusic"] integerValue]==1);wantsMP3=[c[@"format"] isEqualToString:@"mp3"];beginTake();return;}
     BOOL play=[action isEqual:@"play"];
     if(!play&&![action isEqual:@"save"])return;
     NSString *name=c[@"file"];
     if(![name isKindOfClass:NSString.class]||![name isEqual:name.lastPathComponent]||
-       ![name hasPrefix:@"MicFX-"]||![name.pathExtension isEqual:@"mp4"])return;
+       ![name hasPrefix:@"MicFX-"]||!([name.pathExtension isEqual:@"mp4"]||[name.pathExtension isEqual:@"mp3"]))return;
     NSURL *url=[folder URLByAppendingPathComponent:name];
     if(![NSFileManager.defaultManager fileExistsAtPath:url.path]){refreshList();status(@"This clip is no longer on this device.");return;}
     if(play){previewURL=url;atomic_store(&quietRequested,true);lastData=NSProcessInfo.processInfo.systemUptime;state(MFWaitingPreview,@"presenting");}
@@ -210,7 +268,7 @@ void mf_rec_service_start(int supported){
         folder=[support URLByAppendingPathComponent:@"MicFX Recordings" isDirectory:YES];
         session=NSUUID.UUID.UUIDString;
         [prefs setObject:session forKey:@"MicFXRecordSession"];
-        [prefs setObject:@"mp4" forKey:@"MicFXRecordFormats"];
+        [prefs setObject:@"mp4,mp3" forKey:@"MicFXRecordFormats"];
         [prefs setInteger:1 forKey:@"MicFXRecordMixCapable"];
         [prefs setInteger:0 forKey:@"MicFXRecordSeconds"];
         for(NSURL *url in [NSFileManager.defaultManager contentsOfDirectoryAtURL:folder includingPropertiesForKeys:nil options:0 error:nil]){
