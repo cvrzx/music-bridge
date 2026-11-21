@@ -16,6 +16,10 @@ int mf_apo_music_next(unsigned sampleRate,float* left,float* right);
 float mf_apo_music_gain(void);
 unsigned mf_apo_settings_updates(void);
 unsigned mf_apo_music_packets(void);
+// Diagnostics: 0 starting, 1 App Group denied, 2 settings file missing,
+// 3 JSON invalid/unusable, 4 JSON valid (may be unchanged).
+unsigned mf_apo_read_state(void);
+unsigned mf_apo_worker_ticks(void);
 #ifdef __cplusplus
 }
 #endif
