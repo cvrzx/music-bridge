@@ -1,0 +1,49 @@
+name: Compile MicFX 4.7 + APO v5 + MP3 encoder
+on:
+  push:
+    branches:
+      - feature/micfx-v47-apov5-mp3
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify preserved legacy features and bundled encoder
+        run: |
+          node --check plugin/index.js
+          test -f native/DrumShape.h
+          test -f native/ToneEQ.h
+          test -f native/MicMonitor.h
+          test -f native/APOGroup.mm
+          test -f native/MicRecorder.m
+          test -f native/vendor/shine/COPYING
+      - name: Build native ARM64 dylib and test MP4 and real MP3 streams
+        run: bash native/build.sh
+      - name: Check artifact architecture
+        run: |
+          file MicFX.dylib
+          xcrun lipo MicFX.dylib -verify_arch arm64
+      - name: Package experimental unsigned native artifact
+        run: |
+          mkdir -p dist
+          cp MicFX.dylib dist/
+          cat > dist/README.txt <<'EOF'
+          Experimental MicFX 4.7 + APO v5 + MP3 native encoder.
+          The old 4.7 pitch/EQ/Drums/basiQ/monitor/MP4 effects remain in source.
+          MP3 is MONO 48k/128kbps (other supported rates may work).
+          Mixed music recorder taps audio that *actually arrives* in the native bridge.
+          No stock Spotify decrypted PCM capture is implemented by this native library.
+          Real device Discord/Spotify runtime remains UNVERIFIED.
+          ARM64 dylib is UNSIGNED and must be incorporated into the correct IPA and signed.
+          Do not inject alongside a second MicFX.dylib; preserve the current backup.
+          LGPL-2.0 Shine MP3 encoder source and license: native/vendor/shine/
+          EOF
+          shasum -a 256 dist/MicFX.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-v47-APO-v5-REAL-MP3-UNSIGNED
+          path: dist/*
+          if-no-files-found: error
