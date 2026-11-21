@@ -1,5 +1,5 @@
 #!/bin/bash
-# Compile legacy MicFX 4.7 (all existing effects and recorder) with optional APO v5 App Group reader.
+# Build MicFX 4.7 original effects and real MP3 recorder; no other audio suite dependencies.
 # This output is UNSIGNED and must be signed with an authorized app/extension profile.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -8,7 +8,6 @@ mkdir -p ../build/native
 COMMON=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fPIC -fvisibility=hidden)
 xcrun --sdk iphoneos clang "${COMMON[@]}" -std=c11 -Wall -Wextra -c MicFX.c -o ../build/native/MicFX.o
 xcrun --sdk iphoneos clang "${COMMON[@]}" -fobjc-arc -fblocks -Wall -Wextra -c MicRecorder.m -o ../build/native/MicRecorder.o
-xcrun --sdk iphoneos clang++ "${COMMON[@]}" -std=c++17 -fobjc-arc -fblocks -Wall -Wextra -c APOGroup.mm -o ../build/native/APOGroup.o
 # Keep Shine's LGPL-2.0 source in vendor/shine for redistribution and relinking.
 SHINE_OBJECTS=()
 for source in vendor/shine/*.c; do
@@ -16,7 +15,7 @@ for source in vendor/shine/*.c; do
   xcrun --sdk iphoneos clang "${COMMON[@]}" -std=c11 -Wall -Wextra -Ivendor/shine -c "$source" -o "$obj"
   SHINE_OBJECTS+=("$obj")
 done
-xcrun --sdk iphoneos clang++ "${COMMON[@]}" -dynamiclib ../build/native/MicFX.o ../build/native/MicRecorder.o ../build/native/APOGroup.o "${SHINE_OBJECTS[@]}" -framework UIKit -framework QuickLook -framework Foundation -framework AVFoundation -framework AudioToolbox -Wl,-install_name,@rpath/MicFX.dylib -o ../MicFX.dylib
+xcrun --sdk iphoneos clang++ "${COMMON[@]}" -dynamiclib ../build/native/MicFX.o ../build/native/MicRecorder.o "${SHINE_OBJECTS[@]}" -framework UIKit -framework QuickLook -framework Foundation -framework AVFoundation -framework AudioToolbox -Wl,-install_name,@rpath/MicFX.dylib -o ../MicFX.dylib
 file ../MicFX.dylib
 xcrun lipo ../MicFX.dylib -verify_arch arm64
 if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
