@@ -343,6 +343,9 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         int musicPitch=getNum(d,"MicFXMusicPitchEnabled")==1.0;
         int musicBoost=getNum(d,"MicFXMusicAdvancedGainEnabled")==1.0;
         float customGain=limit(getNum(d,"MicFXAdvancedGainDb"),0,240);
+        // Original music boost stays unchanged unless the new UI explicitly supplies independent music gain.
+        int independentMusic=getNum(d,"MicFXIndependentMusicGainClient")==1.0;
+        float musicCustomGain=independentMusic?limit(getNum(d,"MicFXMusicAdvancedGainDb"),0,240):customGain;
         float effectiveGain=advanced?customGain:g;
         atomic_store(&musicPitchEnabled,musicPitch);
         atomic_store(&pitchActive,requestedPitch);
@@ -351,12 +354,12 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         atomic_store(&loudAmount,requestedLoud?limit(getNum(d,"MicFXLoudMicAmount"),0,100)/100.f:0.f);
         atomic_store(&voiceColor,requestedLoud?limit(getNum(d,"MicFXVoiceColor"),0,100)/100.f:0.f);
         atomic_store(&musicAdvancedGainEnabled,musicBoost);
-        atomic_store(&musicAdvancedGain,powf(10.f,customGain/20.f));
+        atomic_store(&musicAdvancedGain,powf(10.f,musicCustomGain/20.f));
         atomic_fetch_add(&configSeq,1);atomic_store(&ratio,powf(2.f,(p+dt/100.f)/12.f));atomic_store(&gain,powf(10.f,effectiveGain/20.f));atomic_store(&blend,m/100.f);
         atomic_store(&eqEnabled,getNum(d,"MicFXEQEnabled")==1.0);for(unsigned i=0;i<MF_EQ;i++)atomic_store(&eqGain[i],limit(getNum(d,eqKeys[i]),-12,12));atomic_fetch_add(&configSeq,1);
         if(on!=activeLast){atomic_fetch_add(&generation,1);activeLast=on;}
         atomic_store(&enabled,on);putNum(d,"MicFXAppliedGainDb",on?effectiveGain:0);
-        putNum(d,"MicFXMusicAppliedGainDb",musicBoost?customGain:0);
+        putNum(d,"MicFXMusicAppliedGainDb",musicBoost?musicCustomGain:0);putNum(d,"MicFXIndependentMusicGain",1);
         putNum(d,"MicFXMusicPitchOn",on&&musicPitch);
         U32 now=atomic_load(&processed);const char *status=bootStatus;
         if(now!=prev)hold=25;else if(hold>0)hold--;
