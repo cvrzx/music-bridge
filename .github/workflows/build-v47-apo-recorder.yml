@@ -1,0 +1,45 @@
+name: Compile MicFX 4.7 + APO v5 music recorder
+on:
+  push:
+    branches:
+      - feature/micfx-v47-apov5-recorder-mix
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate legacy plugin syntax
+        run: node --check plugin/index.js
+      - name: Build unsigned ARM64 MicFX and native recorder test
+        run: bash native/build.sh
+      - name: Validate native output and preservation
+        run: |
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          test -f native/MicRecorder.m
+          test -f native/DrumShape.h
+          test -f native/ToneEQ.h
+          test -f native/APOGroup.mm
+          grep -q 'mf_rec_wants_music' native/MicFX.c
+          grep -q 'mf_apo_start' native/MicFX.c
+      - name: Package unsigned source-matched dylib
+        run: |
+          mkdir -p dist
+          cp MicFX.dylib dist/MicFX.dylib
+          cat > dist/README.txt <<'EOF'
+          Experimental UNSIGNED native MicFX 4.7 + APO v5 merge.
+          Retains the original v4.7 native recorder and effects.
+          Opt-in processed mic + received-music recording is MP4/AAC (not MP3).
+          Spotify decoded PCM capture is NOT supplied by this dylib.
+          No real-device call tests or signer profile included.
+          Target: verified Discord 344.1 ARM64 executable UUID only.
+          Never inject alongside another MicFX dylib; preserve original IPA.
+          EOF
+          shasum -a 256 dist/MicFX.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-v47-APO-v5-UNSIGNED-test
+          path: dist/*
+          if-no-files-found: error
