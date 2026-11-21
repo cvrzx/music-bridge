@@ -96,8 +96,8 @@ static void updateSettings(NSURL* root) {
  readState.store(4,std::memory_order_release);
  bool nextEnabled=[mic[@"enabled"] respondsToSelector:@selector(boolValue)]&&[mic[@"enabled"] boolValue];
  bool nextMute=[mic[@"mute"] respondsToSelector:@selector(boolValue)]&&[mic[@"mute"] boolValue];
- const float nextDb=static_cast<float>(numeric(mic[@"gainDb"],-90,24,0));
- const float nextMusic=static_cast<float>(numeric(mus[@"gainDb"],-90,12,-12));
+ const float nextDb=static_cast<float>(numeric(mic[@"gainDb"],-240,240,0));
+ const float nextMusic=static_cast<float>(numeric(mus[@"gainDb"],-240,240,-12));
  const float nextLeft=static_cast<float>(numeric(mic[@"left"],0,2,1));
  const float nextRight=static_cast<float>(numeric(mic[@"right"],0,2,1));
  NSDictionary* eq=data[@"eq"];
@@ -181,7 +181,7 @@ extern "C" void mf_apo_prepare(unsigned sr) {
  dspMuted=muteMic.load(std::memory_order_relaxed);
  // The outgoing AudioUnit is mono. A one-sided mic route is halved in mono.
  float l=micLeft.load(std::memory_order_relaxed),r=micRight.load(std::memory_order_relaxed);
- float db=std::min(12.f,preampDb.load(std::memory_order_relaxed));
+ float db=preampDb.load(std::memory_order_relaxed);
  dspLevel=std::pow(10.f,db/20.f)*.5f*(l+r);
  dspType=filterType.load(std::memory_order_relaxed);
  dsp=RtBiquad();
