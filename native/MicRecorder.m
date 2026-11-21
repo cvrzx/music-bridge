@@ -7,6 +7,8 @@
 
 MFRecordBuffer mfRec;
 static _Atomic bool quietRequested,monitorStopped;
+static _Atomic int includeReceivedMusic;
+int mf_rec_wants_music(void){return atomic_load_explicit(&includeReceivedMusic,memory_order_relaxed);}
 int mf_rec_wants_quiet(void){return atomic_load(&quietRequested);}
 void mf_rec_monitor_ack(int quiet){atomic_store(&monitorStopped,quiet!=0);}
 
@@ -115,7 +117,7 @@ static void advanceTake(void){
     if(phase==MFTaking){
         BOOL first=framesWritten==0;
         pump();
-        if(first&&framesWritten)status(@"Recording your processed mic.");
+        if(first&&framesWritten)status(atomic_load(&includeReceivedMusic)?@"Recording processed mic + received music.":@"Recording your processed mic.");
         if(writerFailed||atomic_load(&mfRec.interrupted)||!mf_rec_capture_rate()||
            now-lastData>(framesWritten?3:5))stopTake(@"Saved up to the microphone interruption.");
     }
@@ -188,7 +190,7 @@ static void command(void){
     NSString *action=c[@"action"];
     if([action isEqual:@"stop"]&&(phase==MFArming||phase==MFTaking)){stopTake(nil);return;}
     if(phase!=MFIdle)return;
-    if([action isEqual:@"start"]){beginTake();return;}
+    if([action isEqual:@"start"]){atomic_store(&includeReceivedMusic,[c[@"includeMusic"] integerValue]==1);beginTake();return;}
     BOOL play=[action isEqual:@"play"];
     if(!play&&![action isEqual:@"save"])return;
     NSString *name=c[@"file"];
@@ -208,6 +210,8 @@ void mf_rec_service_start(int supported){
         folder=[support URLByAppendingPathComponent:@"MicFX Recordings" isDirectory:YES];
         session=NSUUID.UUID.UUIDString;
         [prefs setObject:session forKey:@"MicFXRecordSession"];
+        [prefs setObject:@"mp4" forKey:@"MicFXRecordFormats"];
+        [prefs setInteger:1 forKey:@"MicFXRecordMixCapable"];
         [prefs setInteger:0 forKey:@"MicFXRecordSeconds"];
         for(NSURL *url in [NSFileManager.defaultManager contentsOfDirectoryAtURL:folder includingPropertiesForKeys:nil options:0 error:nil]){
             if([url.lastPathComponent hasPrefix:@"MicFX-"]&&[url.pathExtension isEqual:@"partial"])[NSFileManager.defaultManager removeItemAtURL:url error:nil];
