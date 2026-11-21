@@ -1,0 +1,54 @@
+name: Build clean MicFX v4.7 with MP3
+on:
+  push:
+    branches:
+      - feature/micfx-v47-mp3-clean
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate original MicFX native effects
+        run: |
+          test -f native/DrumShape.h
+          test -f native/ToneEQ.h
+          test -f native/MicMonitor.h
+          test -f native/PanelAssets.h
+          test -f native/MicRecorder.m
+          test -f native/vendor/shine/COPYING
+          ! grep -q 'APOGroup' native/MicFX.c
+          ! grep -q 'APOGroup' native/build.sh
+          grep -q 'mf_rec_wants_music' native/MicFX.c
+          grep -q 'MicFXIndependentMusicGain' native/MicFX.c
+      - name: Compile original effects plus native MP3 recorder
+        run: bash native/build.sh
+      - name: Verify ARM64 library
+        run: |
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          file MicFX.dylib
+      - name: Package unsigned test build
+        run: |
+          mkdir -p dist
+          cp MicFX.dylib dist/MicFX.dylib
+          cat > dist/README.txt <<'EOF'
+          MicFX 4.7 native effects, Sweet Drums, basiQ, live mic monitor,
+          original audio-only MP4 recorder, plus real MP3 and optional
+          post-mix microphone + incoming Spotify Bridge PCM recording.
+          NO Equalizer APO is included.
+          An unsigned dylib must be embedded into a matching Discord IPA, then
+          signed and installed with a compatible provisioning profile.
+          Tested by CI: compilation, architecture, synthetic MP4 and MP3.
+          NOT tested: live Discord voice or Spotify's actual PCM capture.
+          It cannot capture music unless Spotify Bridge delivers PCM packets.
+          Keep an IPA backup and do not stack two versions of MicFX.dylib.
+          Shine MP3 encoder source is included under LGPL-2.0 in native/vendor/shine.
+          EOF
+          shasum -a 256 dist/MicFX.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-47-CLEAN-MP3-UNSIGNED
+          path: dist/*
+          if-no-files-found: error
