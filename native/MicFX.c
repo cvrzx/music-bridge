@@ -366,7 +366,47 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         U32 cap=atomic_load(&capture)!=0; double request=getNum(d,"MicFXRequestID");
         if(hooked){if(!cap)status="Hooks installed; ready for supported mono microphone";else if(!on)status="Microphone detected; processor disabled";else if(hold)status="Native processor active (microphone buffers processed)";else status="Pitch enabled; waiting for microphone buffers";}
         if(request!=lastRequest||on!=lastOn||cap!=lastCapture){putNum(d,"MicFXNativeVersion",4);putNum(d,"MicFXNativeHooked",hooked);putNum(d,"MicFXNativeOn",on);putNum(d,"MicFXNativeRate",cap?atomic_load(&sampleRate):0);putNum(d,"MicFXBasiqAck",request);putNum(d,"MicFXRecordBuildAck",request);putNum(d,"MicFXDrumsAck",request);putNum(d,"MicFXNativeAck",request);lastRequest=request;lastOn=on;lastCapture=cap;}
-        if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str("group.f172ad8c5e5f97bc.1"));void *path=url?((void*(*)(void*,void*))msg)(url,sel("path")):0;const char *dir=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;put(d,"MicFXMusicContainerPath",dir?dir:"DENIED");if(dir)musicRead(dir);else musicReset();unsigned readerState=atomic_load(&musicReadState);
+        if(status!=last){put(d,"MicFXPitchStatus",status);last=status;}prev=now;int mo=hooked&&getNum(d,"MicFXMusicEnabled")==1;int allowMix=mo&&getNum(d,"MicFXMusicCallMix")==1;atomic_store(&musicMixEnabled,allowMix);installMusicSessionHooks();static U32 mixPollCount=0;if(allowMix&&((++mixPollCount%100u)==1u))applyMusicSessionMix();static int lastCallMix=-1;if(lastCallMix!=allowMix){put(d,"MicFXCallMixStatus",allowMix?"Mix With Others enabled for supported audio-session categories":"Mix With Others off");lastCallMix=allowMix;}putNum(d,"MicFXMixSessionHooks",atomic_load(&musicMixHooks));putNum(d,"MicFXMixSessionPatches",atomic_load(&musicMixPatches));putNum(d,"MicFXMixSessionAttempts",atomic_load(&musicMixAttempts));putNum(d,"MicFXMixSessionFailures",atomic_load(&musicMixFailures));atomic_store(&musicVol,limit(getNum(d,"MicFXMusicVolume"),0,100)/100);atomic_store(&micVol,limit(getNum(d,"MicFXMicVolume"),0,100)/100);atomic_store(&musicOn,mo);if(mo){
+          // App Group membership is authorized by the iOS signing entitlement, never by path spoofing.
+          // Test the five groups in the user's signing profile and choose the actual live sender.
+          // The UUID match only prioritizes the currently observed sender container; fresh
+          // packets from a different entitled group also work if the UUID changes.
+          static char chosenDir[1024]={0},chosenGroup[80]={0};
+          static uint64_t lastProbeMs=0;
+          static int chosenTarget=0;
+          uint64_t nowProbe=musicNow();
+          if(!lastProbeMs||nowProbe<lastProbeMs||nowProbe-lastProbeMs>=1000){
+            void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));
+            char bestDir[1024]={0},bestGroup[80]={0};
+            uint64_t bestLatest=0;int bestTarget=0;
+            for(unsigned groupNumber=1;groupNumber<=5;groupNumber++){
+              char groupName[80];
+              snprintf(groupName,sizeof(groupName),"group.f172ad8c5e5f97bc.%u",groupNumber);
+              void *url=((void*(*)(void*,void*,void*))msg)(fm,sel("containerURLForSecurityApplicationGroupIdentifier:"),str(groupName));
+              if(!url)continue;  // No entitlement to access this App Group.
+              void *path=((void*(*)(void*,void*))msg)(url,sel("path"));
+              const char *candidate=path?((const char*(*)(void*,void*))msg)(path,sel("UTF8String")):0;
+              if(!candidate||!*candidate||strlen(candidate)>=sizeof(bestDir))continue;
+              uint64_t latest=musicLatestPacketTime(candidate);
+              int isTarget=strstr(candidate,"9FC494BE-4B8C-4F21-BCFE-99CDF3057575")!=0;
+              if(!bestDir[0]||(isTarget&&!bestTarget)||(!bestTarget&&latest>bestLatest)){
+                snprintf(bestDir,sizeof(bestDir),"%s",candidate);
+                snprintf(bestGroup,sizeof(bestGroup),"%s",groupName);
+                bestLatest=latest;bestTarget=isTarget;
+              }
+            }
+            if(strcmp(chosenDir,bestDir)!=0){
+              musicReset();snprintf(chosenDir,sizeof(chosenDir),"%s",bestDir);
+            }
+            snprintf(chosenGroup,sizeof(chosenGroup),"%s",bestGroup);
+            chosenTarget=bestTarget;lastProbeMs=nowProbe;
+          }
+          const char *dir=chosenDir[0]?chosenDir:0;
+          put(d,"MicFXMusicContainerPath",dir?dir:"DENIED");
+          put(d,"MicFXMusicGroupID",chosenGroup[0]?chosenGroup:"DENIED");
+          putNum(d,"MicFXMusicSpotifyContainerMatch",chosenTarget);
+          if(dir)musicRead(dir);else musicReset();
+          unsigned readerState=atomic_load(&musicReadState);
         const char *readerStatus=!dir?"App Group denied":
           readerState==1?"App Group open; no Spotify packets visible (check matching signing/group)":
           readerState==2?"App Group open; packet file invalid (check sender protocol)":
