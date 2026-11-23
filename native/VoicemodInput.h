@@ -8,14 +8,14 @@
 #include <stdatomic.h>
 #define VQ 32768u
 static pthread_mutex_t vmLock=PTHREAD_MUTEX_INITIALIZER;
-static int16_t vmQ[VQ]; static unsigned qr,qw; static double phase;
+static int16_t vmQ[VQ]; static unsigned vmQr,vmQw; static double vmPhase;
 static _Atomic(unsigned) vmOn,vmPackets,vmMixed;
-static _Atomic(float) vmVol=.5f,micVol=1.f;
+static _Atomic(float) vmVol=.7f;
 /* Reader diagnostics: 1=no files, 2=invalid, 3=stale, 4=fresh, 5=accepted new packet. */
 static _Atomic(unsigned) vmReadState,vmFileCount,vmInvalidCount,vmStaleCount,vmNewestAge;
 static uint64_t vmSession,vmSeq;
 static uint64_t vmNow(void){struct timespec t;clock_gettime(CLOCK_REALTIME,&t);return (uint64_t)t.tv_sec*1000+t.tv_nsec/1000000;}
-static void vmReset(void){pthread_mutex_lock(&vmLock);qr=qw=0;phase=0;pthread_mutex_unlock(&vmLock);vmSession=vmSeq=0;}
+static void vmReset(void){pthread_mutex_lock(&vmLock);vmQr=vmQw=0;vmPhase=0;pthread_mutex_unlock(&vmLock);vmSession=vmSeq=0;}
 static void vmRead(const char *dir){
  MBPacket p,best;uint64_t now=vmNow();int found=0;
  unsigned files=0,invalid=0,stale=0;
@@ -40,8 +40,8 @@ static void vmRead(const char *dir){
  atomic_store(&vmNewestAge,(unsigned)(now-best.time_ms));
  if(best.session==vmSession&&best.seq<=vmSeq){atomic_store(&vmReadState,4);return;}
  pthread_mutex_lock(&vmLock);
- if(best.session!=vmSession||best.seq!=vmSeq+1||qw-qr>MB_FRAMES*3){qr=qw=0;phase=0;}
- for(unsigned i=0;i<MB_FRAMES;i++)vmQ[qw++&(VQ-1)]=best.pcm[i];
+ if(best.session!=vmSession||best.seq!=vmSeq+1||vmQw-vmQr>MB_FRAMES*3){vmQr=vmQw=0;vmPhase=0;}
+ for(unsigned i=0;i<MB_FRAMES;i++)vmQ[vmQw++&(VQ-1)]=best.pcm[i];
  pthread_mutex_unlock(&vmLock);
  vmSession=best.session;vmSeq=best.seq;
  atomic_fetch_add(&vmPackets,1);atomic_store(&vmReadState,5);
@@ -63,26 +63,11 @@ static uint64_t vmLatestPacketTime(const char *dir){
   }
   return latest;
 }
-/* Once per 500 ms, choose the authorized App Group with fresh soundboard packets. */
-static uint64_t vmLatestPacketTime(const char *dir){
-  if(!dir||!*dir)return 0;
-  uint64_t now=vmNow(),latest=0;
-  MBPacket p;
-  for(unsigned i=0;i<MB_SLOTS;i++){
-    char path[4096];
-    if(snprintf(path,sizeof(path),"%s/MicFXVoicemod-v1/slot-%02u.bin",dir,i)>=(int)sizeof(path))continue;
-    FILE *f=fopen(path,"rb");if(!f)continue;
-    size_t n=fread(&p,1,sizeof(p),f);fclose(f);
-    if(n!=sizeof(p)||!mb_valid(&p)||p.time_ms>now||now-p.time_ms>1500)continue;
-    if(p.time_ms>latest)latest=p.time_ms;
-  }
-  return latest;
-}
 static float vmNext(unsigned sr){
- if(qw-qr<2)return 0;
- unsigned a=qr&(VQ-1),b=(qr+1)&(VQ-1);
- float y=(vmQ[a]+(vmQ[b]-vmQ[a])*phase)/32768.f;
- phase+=48000.0/sr;unsigned advance=(unsigned)phase;phase-=advance;
- if(advance>qw-qr)advance=qw-qr;qr+=advance;return y;
+ if(vmQw-vmQr<2)return 0;
+ unsigned a=vmQr&(VQ-1),b=(vmQr+1)&(VQ-1);
+ float y=(vmQ[a]+(vmQ[b]-vmQ[a])*vmPhase)/32768.f;
+ vmPhase+=48000.0/sr;unsigned advance=(unsigned)vmPhase;vmPhase-=advance;
+ if(advance>vmQw-vmQr)advance=vmQw-vmQr;vmQr+=advance;return y;
 }
 #endif
