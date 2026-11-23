@@ -1,0 +1,53 @@
+name: Build independent Voicemod and Endcord audio bridge
+on:
+  push:
+    branches: [feature/micfx-voicemod-dual-input]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  bridge:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify independent audio sources and protected effects
+        run: |
+          grep -q 'MicFXVoicemod-v1' voicemod/VoicemodBridge.m
+          grep -q 'MicFXVoicemod-v1' native/VoicemodInput.h
+          grep -q 'vmNext' native/MicFX.c
+          grep -q 'musicNext' native/MicFX.c
+          grep -q 'mf_rec_wants_music' native/MicFX.c
+          test -f native/DrumShape.h
+          test -f native/ToneEQ.h
+          test -f native/MicMonitor.h
+          test -f native/vendor/shine/COPYING
+          ! grep -q 'APOGroup' native/MicFX.c
+      - name: Build Voicemod sender for arm64
+        run: bash voicemod/build.sh
+      - name: Build Endcord dual-source MicFX receiver and MP3
+        run: bash native/build.sh
+      - name: Check architecture and dependencies
+        run: |
+          xcrun lipo VoicemodBridge.dylib -verify_arch arm64
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          file VoicemodBridge.dylib MicFX.dylib
+      - name: Prepare binaries and instructions
+        run: |
+          mkdir -p dist
+          cp VoicemodBridge.dylib MicFX.dylib dist/
+          cat > dist/README.txt <<'EOF'
+          Experimental separate Voicemod + Spotify bridge for Endcord 344.1.
+          VoicemodBridge.dylib writes MicFXVoicemod-v1 packets in authorized
+          group.f172ad8c5e5f97bc.1; MicFX.dylib reads them separately
+          and combines them with the existing Spotify mix and microphone.
+          Both apps need matching App Group signing rights.
+          Compile and format tests run in CI; on-device audio remains unverified.
+          The receiver expects the original Discord 344.1 executable UUID.
+          Do not stack duplicate MicFX dylibs or replace Spotify.
+          EOF
+          shasum -a 256 dist/*.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-Voicemod-Dual-Input-ARM64-UNSIGNED
+          path: dist/*
+          if-no-files-found: error
