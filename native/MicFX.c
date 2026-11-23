@@ -33,8 +33,106 @@ static OSStatus (*getProp)(AU,U32,U32,U32,void*,U32*);
 static void *(*getComp)(AU); static OSStatus (*getDesc)(void*,ComponentDesc*);
 static _Atomic(uintptr_t) capture;
 static _Atomic(U32) sampleRate,formatKind,generation,processed,enabled;
+/* Outgoing and incoming audio are distinct. The output recorder never falls
+   back to bus 1 (the microphone) when the playback callback is unavailable. */
+typedef OSStatus (*MFRenderProc)(void*,U32*,const void*,U32,U32,Buffers*);
+typedef struct { MFRenderProc proc; void *ref; } MFCallback;
+typedef struct { AU unit; MFCallback original; } MFPlaybackContext;
+static MFPlaybackContext playbackContexts[128];
+static _Atomic(unsigned) playbackContextCount,playbackHookInstalled,playbackRate,playbackFormat,playbackCallbacks,playbackRecordedFrames;
+static _Atomic(uintptr_t) playbackUnit;
+static OSStatus (*origSetProp)(AU,U32,U32,U32,const void*,U32);
+static atomic_flag playbackRecordBusy=ATOMIC_FLAG_INIT;
+#define REC_LOCAL_CAP 32768u
+static float recLocalRing[REC_LOCAL_CAP];
+static unsigned recLocalRead,recLocalWrite,recLocalRate;
+static double recLocalPhase;
+static pthread_mutex_t recLocalLock=PTHREAD_MUTEX_INITIALIZER;
+void mf_rec_reset_local_mix(void){
+    pthread_mutex_lock(&recLocalLock);recLocalRead=recLocalWrite=recLocalRate=0;recLocalPhase=0;pthread_mutex_unlock(&recLocalLock);
+}
+static float recLocalNext(unsigned rate){
+    if(!rate||!recLocalRate||recLocalWrite-recLocalRead<2)return 0.f;
+    unsigned a=recLocalRead&(REC_LOCAL_CAP-1),b=(recLocalRead+1)&(REC_LOCAL_CAP-1);
+    float sample=recLocalRing[a]+(recLocalRing[b]-recLocalRing[a])*(float)recLocalPhase;
+    recLocalPhase+=(double)recLocalRate/rate;
+    unsigned step=(unsigned)recLocalPhase;recLocalPhase-=step;
+    unsigned available=recLocalWrite-recLocalRead;
+    if(step>available)step=available;
+    recLocalRead+=step;return sample;
+}
 unsigned mf_rec_capture_rate(void){
-    return atomic_load(&capture)?atomic_load(&sampleRate):0;
+    uintptr_t unit=atomic_load(&capture);
+    if(!unit)return 0;
+    if(mf_rec_wants_remote())return atomic_load(&playbackUnit)==unit?atomic_load(&playbackRate):0;
+    return atomic_load(&sampleRate);
+}
+static void playbackRefresh(AU unit){
+    ASBD f={0}; U32 size=sizeof(f);
+    atomic_store(&playbackRate,0);atomic_store(&playbackFormat,0);
+    if(atomic_load(&playbackUnit)!=(uintptr_t)unit)return;
+    if(getProp(unit,8,1,0,&f,&size)||size!=sizeof(f)||f.format!=FOUR('l','p','c','m')||
+       f.channels<1||f.channels>2||f.rate<8000||f.rate>96000||f.framesPacket!=1||(f.flags&2u)||!(f.flags&8u))return;
+    int planar=(f.flags&32u)!=0;
+    unsigned kind=0;
+    if(f.bits==16&&(f.flags&4u)&&!(f.flags&1u))kind=1;
+    else if(f.bits==32&&(f.flags&1u))kind=2;
+    if(!kind||f.bytesFrame!=(kind==1?2u:4u)*(planar?1u:f.channels))return;
+    atomic_store(&playbackFormat,kind|(f.channels<<4)|(planar?256u:0u));
+    atomic_store(&playbackRate,(unsigned)f.rate);
+}
+static OSStatus playbackCallback(void *ref,U32 *flags,const void *ts,U32 bus,U32 n,Buffers *b){
+    MFPlaybackContext *c=ref;
+    OSStatus rc=c->original.proc(c->original.ref,flags,ts,bus,n,b);
+    if(rc||bus!=0||atomic_load(&capture)!=(uintptr_t)c->unit||atomic_load(&playbackUnit)!=(uintptr_t)c->unit)return rc;
+    atomic_fetch_add(&playbackCallbacks,1);
+    if(!mf_rec_wants_remote()||!atomic_load(&mfRec.armed)||!b||!n||n>MF_REC_FRAMES)return rc;
+    unsigned rate=atomic_load(&playbackRate),format=atomic_load(&playbackFormat);
+    unsigned kind=format&15u,ch=(format>>4)&15u,planar=(format&256u)!=0,bytes=kind==1?2u:4u;
+    if(!rate||(kind!=1&&kind!=2)||ch<1||ch>2||b->count!=(planar?ch:1u))return rc;
+    int silent=flags&&(*flags&16u);
+    if(!silent){
+        for(unsigned j=0;j<b->count;j++)
+            if(!b->buffers[j].data||b->buffers[j].bytes<n*bytes*(planar?1u:ch))return rc;
+    }
+    if(atomic_flag_test_and_set(&playbackRecordBusy))return rc;
+    MFRecordBlock *block=mf_rec_begin(n,rate);
+    if(block){
+        int local=(mf_rec_wants_own_mic()||mf_rec_wants_music())&&pthread_mutex_trylock(&recLocalLock)==0;
+        for(unsigned i=0;i<n;i++){
+            float sum=0.f;
+            if(!silent)for(unsigned j=0;j<ch;j++){
+                unsigned index=planar?i:i*ch+j;
+                void *data=b->buffers[planar?j:0].data;
+                float x=kind==1?((int16_t*)data)[index]/32768.f:((float*)data)[index];
+                if(isfinite(x))sum+=x;
+            }
+            block->samples[i]=mf_clip(sum/ch+(local?recLocalNext(rate):0.f));
+        }
+        if(local)pthread_mutex_unlock(&recLocalLock);
+        mf_rec_publish();atomic_fetch_add(&playbackRecordedFrames,n);
+    }
+    atomic_flag_clear(&playbackRecordBusy);return rc;
+}
+static OSStatus setPropHook(AU unit,U32 prop,U32 scope,U32 element,const void *data,U32 size){
+    // AURenderCallbackStruct, kAudioUnitProperty_SetRenderCallback, input scope, output bus 0.
+    if(prop!=23||scope!=1||element!=0||!data||size!=sizeof(MFCallback))
+        return origSetProp(unit,prop,scope,element,data,size);
+    const MFCallback *callback=data;
+    if(!callback->proc||callback->proc==playbackCallback){
+        return origSetProp(unit,prop,scope,element,data,size);
+    }
+    ComponentDesc d={0};void *component=getComp(unit);
+    if(!component||getDesc(component,&d)||d.type!=FOUR('a','u','o','u')||d.manufacturer!=FOUR('a','p','p','l')||
+       (d.subtype!=FOUR('r','i','o','c')&&d.subtype!=FOUR('v','p','i','o')))
+        return origSetProp(unit,prop,scope,element,data,size);
+    unsigned index=atomic_fetch_add(&playbackContextCount,1);
+    if(index>=128)return origSetProp(unit,prop,scope,element,data,size);
+    MFPlaybackContext *context=&playbackContexts[index];context->unit=unit;context->original=*callback;
+    MFCallback wrapped={playbackCallback,context};
+    OSStatus rc=origSetProp(unit,prop,scope,element,&wrapped,sizeof(wrapped));
+    if(!rc){atomic_store(&playbackUnit,(uintptr_t)unit);if(atomic_load(&capture)==(uintptr_t)unit)playbackRefresh(unit);}
+    return rc;
 }
 static _Atomic(float) ratio=1.f,gain=1.f,blend=1.f,eqGain[MF_EQ];
 static _Atomic(float) musicAdvancedGain=1.f;
@@ -56,7 +154,7 @@ static U32 lastTone,toneGeneration;
 static U32 dspGeneration,musicDspGeneration;
 static int musicDspFlags=-1;
 static const char *bootStatus="Native bridge not initialized";
-static void clearCapture(AU u) { uintptr_t expected=(uintptr_t)u; if(atomic_compare_exchange_strong(&capture,&expected,0)) atomic_fetch_add(&generation,1); }
+static void clearCapture(AU u) { uintptr_t expected=(uintptr_t)u; if(atomic_compare_exchange_strong(&capture,&expected,0)){atomic_fetch_add(&generation,1);atomic_store(&playbackRate,0);atomic_store(&playbackFormat,0);} }
 static OSStatus initHook(AU u) {
     OSStatus r=origInit(u); if(r)return r;
     ComponentDesc d={0}; ASBD f={0}; U32 size=sizeof(f); void *c=getComp(u);
@@ -69,10 +167,10 @@ static OSStatus initHook(AU u) {
     if(!valid)return r;
     U32 kind=0;if(f.bits==16&&f.bytesFrame==2&&(f.flags&4u)&&!(f.flags&1u))kind=1;else if(f.bits==32&&f.bytesFrame==4&&(f.flags&1u))kind=2;
     if(!kind)return r;
-    atomic_store(&capture,0); atomic_store(&sampleRate,(U32)f.rate);atomic_store(&formatKind,kind);atomic_fetch_add(&generation,1);atomic_store(&capture,(uintptr_t)u);return r;
+    atomic_store(&capture,0); atomic_store(&sampleRate,(U32)f.rate);atomic_store(&formatKind,kind);atomic_fetch_add(&generation,1);atomic_store(&capture,(uintptr_t)u);playbackRefresh(u);return r;
 }
 static OSStatus uninitHook(AU u){clearCapture(u);return origUninit(u);}
-static OSStatus disposeHook(AU u){clearCapture(u);return origDispose(u);}
+static OSStatus disposeHook(AU u){clearCapture(u);uintptr_t expected=(uintptr_t)u;atomic_compare_exchange_strong(&playbackUnit,&expected,0);return origDispose(u);}
 static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers *b){
     OSStatus r=origRender(u,flags,ts,bus,n,b); if(r||bus!=1||(!atomic_load(&enabled)&&!atomic_load(&musicOn)&&!atomic_load(&vmOn)&&!atomic_load(&monFeedOn)&&!atomic_load(&mfRec.armed))||atomic_load(&capture)!=(uintptr_t)u||!b||b->count!=1||!n||n>4096||!b->buffers[0].data||b->buffers[0].channels!=1)return r;
     U32 fmt=atomic_load(&formatKind),sr=atomic_load(&sampleRate),gen=atomic_load(&generation); if((fmt!=1&&fmt!=2)||sr<8000||sr>96000||b->buffers[0].bytes<n*(fmt==1?2u:4u))return r;
@@ -124,13 +222,17 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
         int silent=flags&&(*flags&16u);int audible=0,vmAudible=0;
         int monitoring=atomic_load_explicit(&monFeedOn,memory_order_relaxed);
         uint64_t monitorWrite=monitoring?atomic_load_explicit(&monWrite,memory_order_relaxed):0;
-        MFRecordBlock *record=mf_rec_begin(n,sr);
+        int remoteRecord=mf_rec_wants_remote();
+        MFRecordBlock *record=remoteRecord?0:mf_rec_begin(n,sr);
+        int recordLocal=remoteRecord&&atomic_load(&mfRec.armed)&&(mf_rec_wants_own_mic()||mf_rec_wants_music())&&pthread_mutex_trylock(&recLocalLock)==0;
+        if(recordLocal&&recLocalRate!=sr){recLocalRate=sr;recLocalRead=recLocalWrite=0;recLocalPhase=0;}
         float monitorPower=0.f,monitorPeak=0.f;
-        if(!silent||mus||vm||monitoring||record)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
+        if(!silent||mus||vm||monitoring||record||recordLocal)for(U32 i=0;i<n;i++){float x=silent?0:fmt==1?((int16_t*)b->buffers[0].data)[i]/32768.f:((float*)b->buffers[0].data)[i];float y=fx?mf_sample(&dsp,x,p,g,m,sr):x;
             if(fx&&(loud>0.f||color>0.f))y=mf_loud_sample(&loudVoice,y,loudBoost,loud,color,sr);
             if(drum)y=drum_sample(&drumShape,y);
             if(tone)y=tone_sample(&toneEQ,y);
             float micRecordSample=mon_clip(y);
+            float recordLocalSample=mf_rec_wants_own_mic()?micRecordSample:0.f;
             /* Local preview taps the processed microphone only, before Spotify.
                Does not duplicate/re-route anything into the voice encoder. */
             if(monitoring){
@@ -143,23 +245,31 @@ static OSStatus renderHook(AU u,U32 *flags,const void *ts,U32 bus,U32 n,Buffers 
                 float z=locked?musicNext(sr):0.f;
                 // Music effects stay independent from microphone effects.
                 if(musicProcessingFlags)z=mf_sample(&musicDsp,z,pitchMusic?p:1.f,musicBoostFactor,pitchMusic?m:1.f,sr);
+                if(recordLocal&&mf_rec_wants_music())recordLocalSample+=z*mv;
                 y=mf_clip(y*iv+z*mv);
                 if(z!=0.f)audible=1;
             }else if(vm){y=mf_clip(y*iv);}
             if(vm){
                 // Independent soundboard source: no voice EQ/pitch/gain on clips.
                 float clip=vmLocked?vmNext(sr):0.f;
-                y=mf_clip(y+clip*atomic_load(&vmVol));
+                float vmSample=clip*atomic_load(&vmVol);
+                if(recordLocal&&mf_rec_wants_music())recordLocalSample+=vmSample;
+                y=mf_clip(y+vmSample);
                 if(clip!=0.f){audible=1;vmAudible=1;}
             }
             // Legacy mic-only default remains unchanged. Opt in to the actual outgoing mix.
             if(record)record->samples[i]=mf_rec_wants_music()?mon_clip(y):micRecordSample;
+            if(recordLocal){
+                if(recLocalWrite-recLocalRead>=REC_LOCAL_CAP-1)recLocalRead=recLocalWrite-REC_LOCAL_CAP/2;
+                recLocalRing[recLocalWrite++&(REC_LOCAL_CAP-1)]=mon_clip(recordLocalSample);
+            }
             if(fx||mus||vm||monitoring){
                 if(fmt==1)((int16_t*)b->buffers[0].data)[i]=(int16_t)(y>=0?y*32767.f:y*32768.f);
                 else ((float*)b->buffers[0].data)[i]=y;
             }
         }
         if(record)mf_rec_publish();
+        if(recordLocal)pthread_mutex_unlock(&recLocalLock);
         if(monitoring){
             mon_publish_samples(monitorWrite,n);
             atomic_store(&monRms,sqrtf(monitorPower/n));
@@ -190,8 +300,15 @@ static int install(void){
     uint64_t page=(uintptr_t)slots[0]&~(pageSize-1);for(int i=1;i<4;i++)if(((uintptr_t)slots[i]&~(pageSize-1))!=page){bootStatus="Audio import slots not on one page";return 0;}
     if(mach_vm_protect(mach_task_self_,page,pageSize,0,1|2|16)){bootStatus="iOS denied import rebinding; no hooks installed";return 0;}
     for(int i=0;i<4;i++)__atomic_store_n(slots[i],replacement[i],__ATOMIC_RELEASE);
+    // Independently verified exact Discord 344.1 import slot from its indirect-symbol table.
+    // Optional playback hook never disables legacy mic effects if unavailable.
+    void **outputSlot=(void**)(slide+0x102ccdae0ull);
+    origSetProp=SYM("AudioUnitSetProperty");
+    int outputHook=origSetProp&&*outputSlot==(void*)origSetProp&&(((uintptr_t)outputSlot&~(pageSize-1))==page);
+    if(outputHook)__atomic_store_n(outputSlot,(void*)setPropHook,__ATOMIC_RELEASE);
     int protect=mach_vm_protect(mach_task_self_,page,pageSize,0,1);
-    if(protect){for(int i=0;i<4;i++)__atomic_store_n(slots[i],expected[i],__ATOMIC_RELEASE);mach_vm_protect(mach_task_self_,page,pageSize,0,1);bootStatus="Page protection restore failed; hooks rolled back";return 0;}
+    if(protect){if(outputHook)__atomic_store_n(outputSlot,(void*)origSetProp,__ATOMIC_RELEASE);for(int i=0;i<4;i++)__atomic_store_n(slots[i],expected[i],__ATOMIC_RELEASE);mach_vm_protect(mach_task_self_,page,pageSize,0,1);bootStatus="Page protection restore failed; hooks rolled back";return 0;}
+    atomic_store(&playbackHookInstalled,outputHook);
     bootStatus="Native hooks installed; waiting for supported microphone initialization";return 1;
 }
 // Use NSUserDefaults via the ObjC runtime for RN Settings bridge; no private audio data crosses it.
@@ -473,6 +590,10 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
         putNum(d,"MicFXVoicemodReadState",atomic_load(&vmReadState));
         putNum(d,"MicFXVoicemodFileCount",atomic_load(&vmFileCount));
         put(d,"MicFXVoicemodStatus",!vmEnabled?"Off":!voicemodDir[0]?"App Group unavailable":atomic_load(&vmPackets)?"Soundboard PCM received":"Waiting for soundboard PCM");
+        putNum(d,"MicFXCallAudioRecorderCapable",atomic_load(&playbackHookInstalled));
+        putNum(d,"MicFXCallAudioRate",atomic_load(&playbackRate));
+        putNum(d,"MicFXCallAudioCallbacks",atomic_load(&playbackCallbacks));
+        putNum(d,"MicFXCallAudioRecordedFrames",atomic_load(&playbackRecordedFrames));
         monitorUpdate(d,hooked);poolPop(pool);usleep(20000);
     }return 0;
 }
