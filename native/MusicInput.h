@@ -46,6 +46,23 @@ static void musicRead(const char *dir){
  musicSession=best.session;musicSeq=best.seq;
  atomic_fetch_add(&musicPackets,1);atomic_store(&musicReadState,5);
 }
+/* Probe candidate authorized App Group containers without altering playback state.
+   Called only by the reader worker once per second. */
+static uint64_t musicLatestPacketTime(const char *dir){
+  if(!dir||!*dir)return 0;
+  uint64_t now=musicNow(),latest=0;
+  MBPacket packet;
+  for(unsigned i=0;i<MB_SLOTS;i++){
+    char path[4096];
+    if(snprintf(path,sizeof(path),"%s/MicFXBridgeTest-v1/slot-%02u.bin",dir,i)>=(int)sizeof(path))continue;
+    FILE *f=fopen(path,"rb");if(!f)continue;
+    size_t n=fread(&packet,1,sizeof(packet),f);fclose(f);
+    if(n!=sizeof(packet)||!mb_valid(&packet))continue;
+    if(packet.time_ms>now||now-packet.time_ms>1500)continue;
+    if(packet.time_ms>latest)latest=packet.time_ms;
+  }
+  return latest;
+}
 static float musicNext(unsigned sr){
  if(qw-qr<2)return 0;
  unsigned a=qr&(MQ-1),b=(qr+1)&(MQ-1);
