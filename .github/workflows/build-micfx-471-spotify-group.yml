@@ -1,0 +1,57 @@
+name: Build MicFX 4.7.1 Spotify group receiver
+on:
+  push:
+    branches:
+      - fix/micfx-471-spotify-group-auto
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify original MicFX 4.7 features and group-selection logic
+        run: |
+          test -f native/DrumShape.h
+          test -f native/ToneEQ.h
+          test -f native/MicMonitor.h
+          test -f native/MusicInput.h
+          test -f native/MicRecorder.m
+          test -f native/vendor/shine/COPYING
+          ! grep -q 'APOGroup' native/MicFX.c
+          grep -q 'mf_rec_wants_music' native/MicFX.c
+          grep -q 'musicLatestPacketTime' native/MicFX.c
+          grep -q 'MicFXMusicSpotifyContainerMatch' native/MicFX.c
+          grep -q 'MicFXIndependentMusicGain' native/MicFX.c
+      - name: Build arm64 MicFX 4.7.1 receiver and real MP3 recorder
+        run: bash native/build.sh
+      - name: Verify ARM64 dylib
+        run: |
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          file MicFX.dylib
+      - name: Package unsigned receiver test build
+        run: |
+          mkdir -p dist
+          cp MicFX.dylib dist/MicFX.dylib
+          cat > dist/README.txt <<'EOF'
+          MicFX 4.7.1 Spotify App Group receiver test.
+          Recipient: Endcord/Discord 344.1 ARM64 matching the original hook.
+          Checks entitled group.f172ad8c5e5f97bc.1 through .5.
+          Prefers Spotify observed App Group container 9FC494BE-4B8C-4F21-BCFE-99CDF3057575;
+          also selects freshly written PCM packet directories after Spotify reinstalls.
+          Does NOT bypass iOS App Group permissions. Spotify and Discord must
+          have actual matching App Group entitlements and compatible signing.
+          Preserves Sweet Drums, basiQ, EQ, pitch, monitor, presets, MP4, MP3.
+          Spotify's 48000-Hz stereo packet source remains downmixed to
+          current Discord mono microphone capture path.
+          The dylib is unsigned and must be injected into a matching IPA
+          and correctly signed. Do not stack duplicate MicFX dylibs.
+          Automated build tests only; not tested on a real voice call.
+          EOF
+          shasum -a 256 dist/MicFX.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-471-SPOTIFY-GROUP-RECEIVER-UNSIGNED
+          path: dist/*
+          if-no-files-found: error
