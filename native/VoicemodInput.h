@@ -63,6 +63,21 @@ static uint64_t vmLatestPacketTime(const char *dir){
   }
   return latest;
 }
+/* Once per 500 ms, choose the authorized App Group with fresh soundboard packets. */
+static uint64_t vmLatestPacketTime(const char *dir){
+  if(!dir||!*dir)return 0;
+  uint64_t now=vmNow(),latest=0;
+  MBPacket p;
+  for(unsigned i=0;i<MB_SLOTS;i++){
+    char path[4096];
+    if(snprintf(path,sizeof(path),"%s/MicFXVoicemod-v1/slot-%02u.bin",dir,i)>=(int)sizeof(path))continue;
+    FILE *f=fopen(path,"rb");if(!f)continue;
+    size_t n=fread(&p,1,sizeof(p),f);fclose(f);
+    if(n!=sizeof(p)||!mb_valid(&p)||p.time_ms>now||now-p.time_ms>1500)continue;
+    if(p.time_ms>latest)latest=p.time_ms;
+  }
+  return latest;
+}
 static float vmNext(unsigned sr){
  if(qw-qr<2)return 0;
  unsigned a=qr&(VQ-1),b=(qr+1)&(VQ-1);
