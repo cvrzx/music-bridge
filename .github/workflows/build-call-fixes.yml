@@ -1,0 +1,40 @@
+name: Build MicFX call fixes and narrow Voicemod bridge
+on:
+  push:
+    branches: [fix/micfx-47-call-recording-broadcast]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify original audio features and capture separation
+        run: |
+          test -f native/DrumShape.h
+          test -f native/ToneEQ.h
+          test -f native/MicMonitor.h
+          grep -q 'musicNext' native/MicFX.c
+          grep -q 'vmNext' native/MicFX.c
+          grep -q 'remoteRecord?0:mf_rec_begin' native/MicFX.c
+          grep -q 'includeOwnMic' native/MicRecorder.m
+          grep -q 'actualExtensionID' native/BroadcastPicker.m
+          ! grep -q 'mach_vm_protect' voicemod/VoicemodBridge.m
+          ! grep -q 'setCategory:' voicemod/VoicemodBridge.m
+      - name: Compile narrow Voicemod sender
+        run: bash voicemod/build.sh
+      - name: Compile MicFX output callback recorder and picker fix
+        run: bash native/build.sh
+      - name: Verify ARM64 and package
+        run: |
+          xcrun lipo MicFX.dylib -verify_arch arm64
+          xcrun lipo VoicemodBridge.dylib -verify_arch arm64
+          mkdir -p dist
+          cp MicFX.dylib VoicemodBridge.dylib dist/
+          shasum -a 256 dist/*.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MicFX-47-Call-Fixes-Narrow-Voicemod-UNSIGNED
+          path: dist/*
+          if-no-files-found: error
