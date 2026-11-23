@@ -10,8 +10,10 @@
 
 MFRecordBuffer mfRec;
 static _Atomic bool quietRequested,monitorStopped;
-static _Atomic int includeReceivedMusic;
+static _Atomic int includeReceivedMusic,includeRemoteAudio,includeOwnMic;
 int mf_rec_wants_music(void){return atomic_load_explicit(&includeReceivedMusic,memory_order_relaxed);}
+int mf_rec_wants_remote(void){return atomic_load_explicit(&includeRemoteAudio,memory_order_relaxed);}
+int mf_rec_wants_own_mic(void){return atomic_load_explicit(&includeOwnMic,memory_order_relaxed);}
 int mf_rec_wants_quiet(void){return atomic_load(&quietRequested);}
 void mf_rec_monitor_ack(int quiet){atomic_store(&monitorStopped,quiet!=0);}
 
@@ -61,21 +63,21 @@ static NSString *newName(void){
             [NSUUID.UUID.UUIDString substringToIndex:8],wantsMP3?@"mp3":@"mp4"];
 }
 static void beginTake(void){
-    if(!hookAvailable||mf_rec_capture_rate()==0){idle(@"Join a voice call with Discord’s microphone active, then tap Record.");return;}
+    if(!hookAvailable||mf_rec_capture_rate()==0){idle(mf_rec_wants_remote()?@"Incoming call audio unavailable. Rejoin a voice call and check the playback callback diagnostics.":@"Join a voice call with Discord’s microphone active, then tap Record.");return;}
     NSError *e=nil;
     if(!folder||![NSFileManager.defaultManager createDirectoryAtURL:folder withIntermediateDirectories:YES attributes:nil error:&e]){
         idle(@"Could not open the local recordings folder.");return;
     }
-    framesWritten=0;lastSeconds=0;writerFailed=NO;finishReason=nil;
+    framesWritten=0;lastSeconds=0;writerFailed=NO;finishReason=nil;mf_rec_reset_local_mix();
     [prefs setInteger:0 forKey:@"MicFXRecordSeconds"];
     atomic_store(&quietRequested,true);
     lastData=NSProcessInfo.processInfo.systemUptime;
-    state(MFArming,@"arming");status(@"Waiting for microphone audio…");
+    state(MFArming,@"arming");status(mf_rec_wants_remote()?@"Waiting for incoming call audio…":@"Waiting for microphone audio…");
 }
 static void stopTake(NSString *reason){
     atomic_store(&mfRec.armed,false);
     finishReason=reason;
-    state(MFFinishing,@"finishing");status(@"Finishing MP4…");
+    state(MFFinishing,@"finishing");status(wantsMP3?@"Finishing MP3…":@"Finishing MP4 audio…");
 }
 // Shine MP3 encoding runs only on this serial recorder worker, never in the AudioUnit callback.
 static BOOL mp3WritePacket(const unsigned char *p,int n){
@@ -153,7 +155,7 @@ static void finishTake(void){
     scratchURL=nil;finalURL=nil;
     if(saved)idle(finishReason?:@"Recording ready.");
     else if(writerFailed||error)idle(@"Could not save this recording. Check the available storage and try again.");
-    else idle(@"No microphone audio arrived. Join a voice call and try again.");
+    else idle(mf_rec_wants_remote()?@"No incoming call audio arrived. Rejoin the call and check playback diagnostics. Your microphone was not recorded as a fallback.":@"No microphone audio arrived. Join a voice call and try again.");
 }
 static void advanceTake(void){
     NSTimeInterval now=NSProcessInfo.processInfo.systemUptime;
@@ -175,9 +177,12 @@ static void advanceTake(void){
     if(phase==MFTaking){
         BOOL first=framesWritten==0;
         pump();
-        if(first&&framesWritten)status(atomic_load(&includeReceivedMusic)?(wantsMP3?@"Recording MP3: processed mic + received music.":@"Recording MP4: processed mic + received music."):(wantsMP3?@"Recording processed mic to MP3.":@"Recording your processed mic."));
+        if(first&&framesWritten){
+            if(mf_rec_wants_remote())status(mf_rec_wants_own_mic()||mf_rec_wants_music()?@"Recording incoming call audio and selected local sources.":@"Recording incoming call audio only — microphone excluded.");
+            else status(atomic_load(&includeReceivedMusic)?(wantsMP3?@"Recording MP3: processed mic + received music.":@"Recording MP4: processed mic + received music."):(wantsMP3?@"Recording processed mic to MP3.":@"Recording your processed mic."));
+        }
         if(writerFailed||atomic_load(&mfRec.interrupted)||!mf_rec_capture_rate()||
-           now-lastData>(framesWritten?3:5))stopTake(@"Saved up to the microphone interruption.");
+           now-lastData>(framesWritten?3:5))stopTake(mf_rec_wants_remote()?@"Saved up to the incoming-audio interruption.":@"Saved up to the microphone interruption.");
     }
     if(phase==MFFinishing)finishTake();
 }
@@ -248,7 +253,7 @@ static void command(void){
     NSString *action=c[@"action"];
     if([action isEqual:@"stop"]&&(phase==MFArming||phase==MFTaking)){stopTake(nil);return;}
     if(phase!=MFIdle)return;
-    if([action isEqual:@"start"]){atomic_store(&includeReceivedMusic,[c[@"includeMusic"] integerValue]==1);wantsMP3=[c[@"format"] isEqualToString:@"mp3"];beginTake();return;}
+    if([action isEqual:@"start"]){atomic_store(&includeRemoteAudio,[c[@"includeRemote"] integerValue]==1);atomic_store(&includeOwnMic,[c[@"includeOwnMic"] integerValue]==1);atomic_store(&includeReceivedMusic,[c[@"includeMusic"] integerValue]==1);wantsMP3=[c[@"format"] isEqualToString:@"mp3"];beginTake();return;}
     BOOL play=[action isEqual:@"play"];
     if(!play&&![action isEqual:@"save"])return;
     NSString *name=c[@"file"];
