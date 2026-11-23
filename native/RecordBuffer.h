@@ -37,6 +37,9 @@ static inline void mf_rec_publish(void){
 
 int mf_rec_wants_quiet(void);
 int mf_rec_wants_music(void);
+int mf_rec_wants_remote(void);
+int mf_rec_wants_own_mic(void);
+void mf_rec_reset_local_mix(void);
 void mf_rec_monitor_ack(int quiet);
 unsigned mf_rec_capture_rate(void);
 void mf_rec_service_start(int supported);
