@@ -379,6 +379,16 @@ static void *poll(void *arg){int hooked=(int)(intptr_t)arg;const char *last=0;U3
             void *fm=((void*(*)(void*,void*))msg)(getClass("NSFileManager"),sel("defaultManager"));
             char bestDir[1024]={0},bestGroup[80]={0};
             uint64_t bestLatest=0;int bestTarget=0;
+            // Match the earlier Spotify method: access the known physical
+            // shared container first. This works only if iOS sandbox rights
+            // already allow it; it does not alter Discord's own app container.
+            const char *spotifyDir="/private/var/mobile/Containers/Shared/AppGroup/9FC494BE-4B8C-4F21-BCFE-99CDF3057575";
+            if(access(spotifyDir,R_OK|X_OK)==0){
+              snprintf(bestDir,sizeof(bestDir),"%s",spotifyDir);
+              snprintf(bestGroup,sizeof(bestGroup),"Spotify shared container (direct)");
+              bestLatest=musicLatestPacketTime(spotifyDir);
+              bestTarget=1;
+            }
             for(unsigned groupNumber=1;groupNumber<=5;groupNumber++){
               char groupName[80];
               snprintf(groupName,sizeof(groupName),"group.f172ad8c5e5f97bc.%u",groupNumber);
