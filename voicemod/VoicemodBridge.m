@@ -5,7 +5,7 @@
 #import <math.h>
 #import "../BridgePacket.h"
 // Narrow sender for Soundboard 1.25.2. Capture scheduled playback buffers only.
-// No raw Mach-O pointer modification, microphone capture, or audio-session rewrite.
+// No raw Mach-O pointer modification or microphone capture; playback mixing is scoped to Playback.
 static dispatch_queue_t worker;
 static dispatch_source_t timer;
 static NSURL *target;
@@ -14,6 +14,48 @@ static NSUInteger offset;
 static uint64_t session,sequence;
 static _Atomic unsigned scheduled,accepted,sent,failures,unsupported;
 static _Atomic int hookReady;
+static _Atomic unsigned mixRequests,mixFailures,bgFinishes;
+static UIBackgroundTaskIdentifier drainTask=UIBackgroundTaskInvalid;
+static _Atomic BOOL drainRequested;
+// Only playback categories are adjusted; retain every existing category option.
+typedef BOOL (*CatOptions)(id,SEL,NSString*,AVAudioSessionCategoryOptions,NSError**);
+typedef BOOL (*CatMode)(id,SEL,NSString*,NSString*,AVAudioSessionCategoryOptions,NSError**);
+typedef BOOL (*CatRoute)(id,SEL,NSString*,NSString*,AVAudioSessionRouteSharingPolicy,AVAudioSessionCategoryOptions,NSError**);
+static CatOptions oldOptions;static CatMode oldMode;static CatRoute oldRoute;
+static AVAudioSessionCategoryOptions mixing(NSString *category,AVAudioSessionCategoryOptions options){
+    if([category isEqualToString:AVAudioSessionCategoryPlayback]&&!(options&AVAudioSessionCategoryOptionMixWithOthers)){
+        atomic_fetch_add(&mixRequests,1);return options|AVAudioSessionCategoryOptionMixWithOthers;
+    }return options;
+}
+static BOOL optionsHook(id self,SEL cmd,NSString *cat,AVAudioSessionCategoryOptions opts,NSError **err){return oldOptions(self,cmd,cat,mixing(cat,opts),err);}
+static BOOL modeHook(id self,SEL cmd,NSString *cat,NSString *mode,AVAudioSessionCategoryOptions opts,NSError **err){return oldMode(self,cmd,cat,mode,mixing(cat,opts),err);}
+static BOOL routeHook(id self,SEL cmd,NSString *cat,NSString *mode,AVAudioSessionRouteSharingPolicy policy,AVAudioSessionCategoryOptions opts,NSError **err){return oldRoute(self,cmd,cat,mode,policy,mixing(cat,opts),err);}
+static void installPlaybackMix(void){
+    Class c=AVAudioSession.class;Method m;
+    m=class_getInstanceMethod(c,@selector(setCategory:withOptions:error:));if(m)oldOptions=(CatOptions)method_setImplementation(m,(IMP)optionsHook);
+    m=class_getInstanceMethod(c,@selector(setCategory:mode:options:error:));if(m)oldMode=(CatMode)method_setImplementation(m,(IMP)modeHook);
+    m=class_getInstanceMethod(c,@selector(setCategory:mode:routeSharingPolicy:options:error:));if(m)oldRoute=(CatRoute)method_setImplementation(m,(IMP)routeHook);
+}
+static void ensurePlaybackMix(void){
+    AVAudioSession *a=AVAudioSession.sharedInstance;
+    if(![a.category isEqualToString:AVAudioSessionCategoryPlayback]||(a.categoryOptions&AVAudioSessionCategoryOptionMixWithOthers))return;
+    NSError *error=nil;
+    if(![a setCategory:a.category mode:a.mode routeSharingPolicy:a.routeSharingPolicy options:a.categoryOptions|AVAudioSessionCategoryOptionMixWithOthers error:&error])atomic_fetch_add(&mixFailures,1);
+}
+// Finish already-queued clip data with the OS's finite background task. No silent audio, no indefinite keepalive.
+static void endDrain(void){
+    atomic_store(&drainRequested,NO);
+    if(drainTask!=UIBackgroundTaskInvalid){[UIApplication.sharedApplication endBackgroundTask:drainTask];drainTask=UIBackgroundTaskInvalid;}
+}
+static void requestDrain(void){
+    if(drainTask!=UIBackgroundTaskInvalid)return;
+    atomic_store(&drainRequested,YES);
+    drainTask=[UIApplication.sharedApplication beginBackgroundTaskWithName:@"Finish soundboard clip" expirationHandler:^{endDrain();}];
+    if(drainTask==UIBackgroundTaskInvalid)atomic_store(&drainRequested,NO);
+}
+static void finishDrainIfEmpty(void){
+    if(atomic_exchange(&drainRequested,NO))dispatch_async(dispatch_get_main_queue(),^{atomic_fetch_add(&bgFinishes,1);endDrain();});
+}
 typedef void (*Schedule)(id,SEL,AVAudioPCMBuffer *,AVAudioTime *,AVAudioPlayerNodeBufferOptions,AVAudioNodeCompletionHandler);
 static Schedule original;
 static _Thread_local int inside;
@@ -60,7 +102,7 @@ static NSURL *sharedTarget(void){
     return dir;
 }
 static void tick(void){
-    if(offset>=pending.length){[pending setLength:0];offset=0;return;}
+    if(offset>=pending.length){[pending setLength:0];offset=0;finishDrainIfEmpty();return;}
     if(!target){target=sharedTarget();if(!target){atomic_fetch_add(&failures,1);[pending setLength:0];offset=0;return;}}
     MBPacket p={0};
     p.magic=MB_MAGIC;p.frames=MB_FRAMES;p.session=session;p.seq=++sequence;p.time_ms=nowms();
@@ -74,6 +116,8 @@ static void schedule(id node,SEL cmd,AVAudioPCMBuffer *buffer,AVAudioTime *time,
     if(inside){original(node,cmd,buffer,time,options,completion);return;}
     inside=1;
     @try {
+        // Set mixing before actual soundboard playback; never start an audio session artificially.
+        ensurePlaybackMix();
         atomic_fetch_add(&scheduled,1);
         NSData *samples=convert(buffer);
         if(samples.length){
@@ -93,7 +137,7 @@ static void schedule(id node,SEL cmd,AVAudioPCMBuffer *buffer,AVAudioTime *time,
 -(void)report:(UITapGestureRecognizer*)gesture{
     if(gesture.state!=UIGestureRecognizerStateRecognized)return;
     dispatch_async(worker,^{
-        NSString *report=[NSString stringWithFormat:@"Voicemod Bridge — narrow playback hook\nHook: %d\nScheduled: %u\nAccepted: %u\nPackets: %u\nFailures: %u\nUnsupported: %u\nGroup folder: %@",atomic_load(&hookReady),atomic_load(&scheduled),atomic_load(&accepted),atomic_load(&sent),atomic_load(&failures),atomic_load(&unsupported),target.path?:@"Not resolved"];
+        NSString *report=[NSString stringWithFormat:@"Voicemod Bridge — narrow playback hook\nHook: %d\nScheduled: %u\nAccepted: %u\nPackets: %u\nFailures: %u\nUnsupported: %u\nMix requests: %u / failures: %u\nBackground drains finished: %u\nGroup folder: %@",atomic_load(&hookReady),atomic_load(&scheduled),atomic_load(&accepted),atomic_load(&sent),atomic_load(&failures),atomic_load(&unsupported),atomic_load(&mixRequests),atomic_load(&mixFailures),atomic_load(&bgFinishes),target.path?:@"Not resolved"];
         dispatch_async(dispatch_get_main_queue(),^{
             UIViewController *vc=((UIWindow*)gesture.view).rootViewController;
             while(vc.presentedViewController)vc=vc.presentedViewController;
@@ -133,6 +177,10 @@ static void startBridge(void){
             atomic_store(&hookReady,1);
         }
     }
+    installPlaybackMix();ensurePlaybackMix();
+    NSNotificationCenter *nc=NSNotificationCenter.defaultCenter;
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n){requestDrain();}];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *n){endDrain();}];
     probe=[VMBridgeProbe new];[probe attach];
     [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(__unused NSTimer*t){[probe attach];}];
 }
