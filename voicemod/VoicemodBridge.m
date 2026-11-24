@@ -15,7 +15,7 @@ static uint64_t session,sequence;
 static _Atomic unsigned scheduled,accepted,sent,failures,unsupported;
 static _Atomic int hookReady;
 static _Atomic unsigned mixRequests,mixFailures,bgFinishes;
-static UIBackgroundTaskIdentifier drainTask=UIBackgroundTaskInvalid;
+static UIBackgroundTaskIdentifier drainTask;
 static _Atomic BOOL drainRequested;
 // Only playback categories are adjusted; retain every existing category option.
 typedef BOOL (*CatOptions)(id,SEL,NSString*,AVAudioSessionCategoryOptions,NSError**);
@@ -163,6 +163,7 @@ static void schedule(id node,SEL cmd,AVAudioPCMBuffer *buffer,AVAudioTime *time,
 @end
 static VMBridgeProbe *probe;
 static void startBridge(void){
+    drainTask=UIBackgroundTaskInvalid;
     worker=dispatch_queue_create("micfx.voicemod.clip",DISPATCH_QUEUE_SERIAL);
     pending=[NSMutableData data];session=(((uint64_t)arc4random()<<32)|arc4random())?:1;
     timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,worker);
