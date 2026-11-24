@@ -9,6 +9,7 @@ COMMON=(-arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -fPIC -fvis
 xcrun --sdk iphoneos clang "${COMMON[@]}" -std=c11 -Wall -Wextra -c MicFX.c -o ../build/native/MicFX.o
 xcrun --sdk iphoneos clang "${COMMON[@]}" -fobjc-arc -fblocks -Wall -Wextra -c MicRecorder.m -o ../build/native/MicRecorder.o
 xcrun --sdk iphoneos clang "${COMMON[@]}" -fobjc-arc -fblocks -Wall -Wextra -c BroadcastPicker.m -o ../build/native/BroadcastPicker.o
+xcrun --sdk iphoneos clang "${COMMON[@]}" -fobjc-arc -fblocks -Wall -Wextra -c SpeakerResume.m -o ../build/native/SpeakerResume.o
 # Keep Shine's LGPL-2.0 source in vendor/shine for redistribution and relinking.
 SHINE_OBJECTS=()
 for source in vendor/shine/*.c; do
@@ -16,7 +17,7 @@ for source in vendor/shine/*.c; do
   xcrun --sdk iphoneos clang "${COMMON[@]}" -std=c11 -Wall -Wextra -Ivendor/shine -c "$source" -o "$obj"
   SHINE_OBJECTS+=("$obj")
 done
-xcrun --sdk iphoneos clang++ "${COMMON[@]}" -dynamiclib ../build/native/MicFX.o ../build/native/MicRecorder.o ../build/native/BroadcastPicker.o "${SHINE_OBJECTS[@]}" -framework UIKit -framework QuickLook -framework Foundation -framework AVFoundation -framework AudioToolbox -framework ReplayKit -Wl,-install_name,@rpath/MicFX.dylib -o ../MicFX.dylib
+xcrun --sdk iphoneos clang++ "${COMMON[@]}" -dynamiclib ../build/native/MicFX.o ../build/native/MicRecorder.o ../build/native/BroadcastPicker.o ../build/native/SpeakerResume.o "${SHINE_OBJECTS[@]}" -framework UIKit -framework QuickLook -framework Foundation -framework AVFoundation -framework AudioToolbox -framework ReplayKit -Wl,-install_name,@rpath/MicFX.dylib -o ../MicFX.dylib
 file ../MicFX.dylib
 xcrun lipo ../MicFX.dylib -verify_arch arm64
 if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
